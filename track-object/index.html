@@ -1,0 +1,692 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SIYI A8 Mini 云台控制系统</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', system-ui, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            min-height: 100vh;
+            color: #fff;
+            padding: 20px;
+        }
+        .container { max-width: 1200px; margin: 0 auto; }
+        h1 {
+            text-align: center;
+            margin-bottom: 30px;
+            color: #00d9ff;
+            text-shadow: 0 0 20px rgba(0, 217, 255, 0.5);
+        }
+        .main-grid {
+            display: grid;
+            grid-template-columns: 1fr 350px;
+            gap: 20px;
+        }
+        .video-section {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 15px;
+            padding: 20px;
+            backdrop-filter: blur(10px);
+        }
+        .video-container {
+            position: relative;
+            width: 100%;
+            aspect-ratio: 4/3;
+            background: linear-gradient(135deg, #0f3460 0%, #16213e 100%);
+            border-radius: 10px;
+            overflow: hidden;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        #videoStream {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            display: none;
+            user-select: none;
+            -webkit-user-drag: none;
+        }
+        #interactionCanvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 10;
+        }
+        .status-overlay {
+            position: absolute;
+            text-align: center;
+            padding: 20px;
+            z-index: 5;
+        }
+        .status-overlay h2 {
+            font-size: 24px;
+            margin-bottom: 10px;
+            color: #00d9ff;
+        }
+        .status-item { margin: 10px 0; font-size: 16px; }
+        .control-panel {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 15px;
+            padding: 20px;
+            backdrop-filter: blur(10px);
+        }
+        .status-card {
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 10px;
+            padding: 15px;
+            margin-bottom: 15px;
+            border-left: 4px solid #00d9ff;
+        }
+        .status-item-row {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 8px;
+            font-size: 14px;
+        }
+        .status-label { color: #aaa; }
+        .status-value { font-weight: bold; color: #00d9ff; }
+        .mode-indicator {
+            padding: 12px 15px;
+            border-radius: 8px;
+            text-align: center;
+            font-weight: bold;
+            margin-bottom: 15px;
+        }
+        .mode-auto { background: linear-gradient(135deg, #00b894, #00cec9); }
+        .mode-object { background: linear-gradient(135deg, #6c5ce7, #a29bfe); }
+        .mode-manual { background: linear-gradient(135deg, #fd79a8, #e84393); }
+        .control-buttons {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+        .btn {
+            padding: 14px 20px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: bold;
+            font-size: 14px;
+            transition: all 0.2s ease;
+        }
+        .btn-primary { background: linear-gradient(135deg, #00d9ff, #0077b6); color: #fff; }
+        .btn-danger { background: linear-gradient(135deg, #ff6b6b, #ee5a5a); color: #fff; }
+        .btn-success { background: linear-gradient(135deg, #51cf66, #37b24d); color: #fff; }
+        .btn-warning { background: linear-gradient(135deg, #f59f00, #f08c00); color: #fff; }
+        .btn-active-hunting { animation: pulse-glow 1.5s infinite alternate; border: 2px solid #fff; }
+        @keyframes pulse-glow {
+            0% { box-shadow: 0 0 5px #00ff88; filter: brightness(1); }
+            100% { box-shadow: 0 0 20px #00ff88; filter: brightness(1.2); }
+        }
+        .btn:hover { transform: translateY(-2px); box-shadow: 0 5px 15px rgba(0, 0, 0, 0.3); }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; box-shadow: none; }
+        .keyboard-help {
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 10px;
+            padding: 15px;
+            margin-top: 15px;
+        }
+        .keyboard-help h3 { margin-bottom: 10px; color: #00d9ff; font-size: 14px; }
+        .key-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 6px 0;
+            font-size: 13px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        .key-row:last-child { border-bottom: none; }
+        .key {
+            background: rgba(255, 255, 255, 0.15);
+            padding: 3px 10px;
+            border-radius: 4px;
+            font-family: monospace;
+        }
+        .log-container {
+            background: rgba(0, 0, 0, 0.5);
+            border-radius: 8px;
+            padding: 10px;
+            height: 180px;
+            overflow-y: auto;
+            font-family: monospace;
+            font-size: 11px;
+            margin-top: 15px;
+        }
+        .log-entry { margin-bottom: 3px; }
+        .log-info { color: #00d9ff; }
+        .log-success { color: #51cf66; }
+        .log-warning { color: #ffd43b; }
+        .log-error { color: #ff6b6b; }
+        .setting-item { margin-bottom: 12px; }
+        .setting-label { display: block; margin-bottom: 5px; font-size: 12px; color: #aaa; }
+        .setting-input {
+            width: 100%;
+            padding: 8px 10px;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 6px;
+            background: rgba(0, 0, 0, 0.3);
+            color: #fff;
+        }
+        .setting-input:focus { outline: none; border-color: #00d9ff; }
+        .connection-status {
+            padding: 10px;
+            border-radius: 8px;
+            margin-bottom: 15px;
+            text-align: center;
+            font-weight: bold;
+        }
+        .conn-ok { background: rgba(81, 207, 102, 0.2); border: 1px solid #51cf66; color: #51cf66; }
+        .conn-error { background: rgba(255, 107, 107, 0.2); border: 1px solid #ff6b6b; color: #ff6b6b; }
+        @media (max-width: 900px) { .main-grid { grid-template-columns: 1fr; } }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎯 SIYI A8 Mini 云台控制系统</h1>
+        <div class="main-grid">
+            <div class="video-section">
+                <div class="video-container" id="videoContainer">
+                    <img id="videoStream" alt="Video Stream">
+                    <canvas id="interactionCanvas"></canvas>
+                    <div class="status-overlay" id="videoOverlay">
+                        <h2>📡 控制系统就绪</h2>
+                        <div class="status-item">相机 IP: <span class="status-value" id="displayCameraIp">192.168.144.25</span></div>
+                        <div class="status-item">UDP 端口：<span class="status-value" id="displayUdpPort">37260</span></div>
+                        <div class="status-item">状态：<span class="status-value" id="mainStatus">等待启动...</span></div>
+                    </div>
+                </div>
+                <div class="log-container" id="logContainer"></div>
+            </div>
+            
+            <div class="control-panel">
+                <div class="connection-status conn-error" id="connStatus">🔴 未连接</div>
+                <div class="mode-indicator mode-auto" id="modeIndicator">🤖 自动人脸跟踪</div>
+                
+                <div class="status-card">
+                    <div class="status-item-row"><span class="status-label">云台 Yaw</span><span class="status-value" id="statusYaw">0</span></div>
+                    <div class="status-item-row"><span class="status-label">云台 Pitch</span><span class="status-value" id="statusPitch">0</span></div>
+                    <div class="status-item-row"><span class="status-label">框选中心 X</span><span class="status-value" id="boxCenterX" style="color:#00ff88">-</span></div>
+                    <div class="status-item-row"><span class="status-label">框选中心 Y</span><span class="status-value" id="boxCenterY" style="color:#00ff88">-</span></div>
+                    <div class="status-item-row"><span class="status-label">后端服务</span><span class="status-value" id="backendStatus">检查中...</span></div>
+                </div>
+                
+                <div class="control-buttons">
+                    <button class="btn btn-success" id="btnStart" onclick="startService()">▶ 启动服务</button>
+                    <button class="btn btn-primary" onclick="centerGimbal()">🎯 回中</button>
+                    <button class="btn btn-primary" onclick="toggleMode()">🔄 切换模式</button>
+                    <button class="btn btn-warning" id="btnSelectRoi" onclick="enableRoiSelection()">🖱️ 框选目标</button>
+                    <button class="btn btn-danger" id="btnClearRoi" onclick="clearRoiSelection()">❌ 清除选框</button>
+                    <button class="btn btn-danger" id="btnStop" onclick="stopService()" disabled style="grid-column: span 2;">⏹ 停止服务</button>
+                </div>
+                
+                <div class="setting-item">
+                    <label class="setting-label">摄像头 IP</label>
+                    <input type="text" class="setting-input" id="cameraIp" value="192.168.144.25">
+                </div>
+                <div class="setting-item">
+                    <label class="setting-label">UDP 端口</label>
+                    <input type="number" class="setting-input" id="udpPort" value="37260">
+                </div>
+                <button class="btn btn-primary" style="width: 100%; margin-top: 10px;" onclick="testConnection()">🔍 测试连接</button>
+                
+                <div class="keyboard-help">
+                    <h3>⌨️ 键盘与鼠标控制</h3>
+                    <div class="key-row"><span><span class="key">W</span> 向上</span><span><span class="key">S</span> 向下</span></div>
+                    <div class="key-row"><span><span class="key">A</span> 向左</span><span><span class="key">D</span> 向右</span></div>
+                    <div class="key-row"><span><span class="key">Shift</span> 加速</span><span><span class="key">Space</span> 回中</span></div>
+                    <div class="key-row"><span><span class="key">T</span> 切换模式</span><span><span class="key">Q</span> 停止</span></div>
+                    <div class="key-row"><span style="grid-column: span 2;"><span class="key">鼠标长按画面</span> 持续调节方向 (松开自动刹车)</span></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // ---------- 状态变量 ----------
+        let manualMode = false;
+        let serviceRunning = false;
+        let controlInterval = null;
+        let ws = null;
+        const keysPressed = {};
+        
+        let isMouseGimbalInteracting = false; 
+        let mouseCurrentYawSpeed = 0;
+        let mouseCurrentPitchSpeed = 0;
+        let mouseLoopInterval = null; 
+
+        let isRoiModeActive = false; 
+        let isDrawing = false;       
+        let startCanvasX = 0, startCanvasY = 0;   // 绘制用的画布坐标
+        let currentCanvasX = 0, currentCanvasY = 0; 
+        let savedRoi = null;         // 已保存的选框（画布坐标，用于重绘）
+
+        const canvas = document.getElementById('interactionCanvas');
+        const ctx = canvas.getContext('2d');
+        
+        // ---------- 视频渲染区域计算（处理 object-fit: contain 的黑边） ----------
+        function getVideoRenderRect() {
+            const container = document.getElementById('videoContainer');
+            const cw = container.clientWidth;
+            const ch = container.clientHeight;
+            const videoW = 640, videoH = 480;
+            const videoRatio = videoW / videoH;
+            const containerRatio = cw / ch;
+            let renderWidth, renderHeight, offsetX, offsetY;
+            if (containerRatio > videoRatio) {
+                renderHeight = ch;
+                renderWidth = ch * videoRatio;
+                offsetX = (cw - renderWidth) / 2;
+                offsetY = 0;
+            } else {
+                renderWidth = cw;
+                renderHeight = cw / videoRatio;
+                offsetX = 0;
+                offsetY = (ch - renderHeight) / 2;
+            }
+            return { x: offsetX, y: offsetY, w: renderWidth, h: renderHeight };
+        }
+
+        // 将画布坐标 (canvasX, canvasY) 转换为原始视频坐标 (640x480)
+        function canvasToVideoCoords(canvasX, canvasY) {
+            const rect = getVideoRenderRect();
+            const scaleX = 640 / rect.w;
+            const scaleY = 480 / rect.h;
+            const videoX = (canvasX - rect.x) * scaleX;
+            const videoY = (canvasY - rect.y) * scaleY;
+            return { x: videoX, y: videoY };
+        }
+
+        // ---------- 日志 ----------
+        function log(message, type = 'info') {
+            const container = document.getElementById('logContainer');
+            const entry = document.createElement('div');
+            entry.className = `log-entry log-${type}`;
+            entry.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
+            container.appendChild(entry);
+            container.scrollTop = container.scrollHeight;
+            if (container.children.length > 50) container.removeChild(container.firstChild);
+        }
+        
+        // ---------- WebSocket 视频流 ----------
+        function initWebSocket() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${window.location.host}/api/ws`;
+            if (ws) ws.close();
+            
+            log('🔌 正在连接视频流...', 'info');
+            ws = new WebSocket(wsUrl);
+            ws.binaryType = 'blob';
+            
+            ws.onopen = () => {
+                log('✅ 视频流已连接', 'success');
+                document.getElementById('videoStream').style.display = 'block';
+                document.getElementById('videoOverlay').style.display = 'none';
+                resizeCanvas(); 
+            };
+            
+            ws.onmessage = (e) => {
+                if (e.data instanceof Blob) {
+                    const img = document.getElementById('videoStream');
+                    const oldUrl = img.src;
+                    img.src = URL.createObjectURL(e.data);
+                    if (oldUrl) URL.revokeObjectURL(oldUrl);
+                }
+            };
+            
+            ws.onclose = () => {
+                log('❌ 视频流连接断开', 'error');
+                document.getElementById('videoStream').style.display = 'none';
+                document.getElementById('videoOverlay').style.display = 'block';
+                if (serviceRunning) setTimeout(initWebSocket, 2000); 
+            };
+        }
+
+        function resizeCanvas() {
+            const container = document.getElementById('videoContainer');
+            canvas.width = container.clientWidth;
+            canvas.height = container.clientHeight;
+            renderCanvasLayers();
+        }
+        window.addEventListener('resize', resizeCanvas);
+
+        // ---------- 绘制选框 ----------
+        function renderCanvasLayers() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            if (isDrawing) {
+                ctx.strokeStyle = '#00ff88';
+                ctx.lineWidth = 2;
+                ctx.setLineDash([6, 4]); 
+                ctx.strokeRect(startCanvasX, startCanvasY, currentCanvasX - startCanvasX, currentCanvasY - startCanvasY);
+                ctx.setLineDash([]); 
+            }
+            if (savedRoi) {
+                ctx.strokeStyle = '#00ff88';
+                ctx.lineWidth = 3;
+                ctx.strokeRect(savedRoi.x, savedRoi.y, savedRoi.w, savedRoi.h);
+                ctx.fillStyle = '#00ff88';
+                const cx = savedRoi.x + savedRoi.w / 2;
+                const cy = savedRoi.y + savedRoi.h / 2;
+                ctx.beginPath(); ctx.arc(cx, cy, 4, 0, 2 * Math.PI); ctx.fill();
+            }
+        }
+
+        // ---------- 框选模式 ----------
+        function enableRoiSelection() {
+            if (!serviceRunning) return log('⚠️ 请先启动服务！', 'warning');
+            isRoiModeActive = true;
+            canvas.style.cursor = 'crosshair';
+            document.getElementById('btnSelectRoi').classList.add('btn-active-hunting');
+            log('鼠标在画面上拖拽框选目标', 'info');
+        }
+
+        async function clearRoiSelection() {
+            savedRoi = null;
+            isRoiModeActive = false;
+            isDrawing = false;
+            canvas.style.cursor = 'default';
+            document.getElementById('btnSelectRoi').classList.remove('btn-active-hunting');
+            document.getElementById('boxCenterX').textContent = '-';
+            document.getElementById('boxCenterY').textContent = '-';
+            renderCanvasLayers();
+            log('🧹 框选目标已清除', 'info');
+            // 通知后端停止物体跟踪
+            try {
+                await fetch('/api/gimbal/stop_tracking', { method: 'POST' });
+                log('🔄 已切回人脸跟踪模式', 'success');
+            } catch (e) {
+                log('停止物体跟踪请求失败', 'warning');
+            }
+        }
+
+        // ---------- 提交选框到后端（物体跟踪） ----------
+        async function submitRoiToBackend(canvasX, canvasY, canvasW, canvasH) {
+            // 转换为视频坐标
+            const topLeft = canvasToVideoCoords(canvasX, canvasY);
+            const bottomRight = canvasToVideoCoords(canvasX + canvasW, canvasY + canvasH);
+            const x = Math.round(Math.min(topLeft.x, bottomRight.x));
+            const y = Math.round(Math.min(topLeft.y, bottomRight.y));
+            const w = Math.round(Math.abs(bottomRight.x - topLeft.x));
+            const h = Math.round(Math.abs(bottomRight.y - topLeft.y));
+
+            if (w < 5 || h < 5) {
+                log('框选区域太小，请重新框选', 'warning');
+                return;
+            }
+
+            try {
+                const response = await fetch('/api/gimbal/start_tracking', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ x, y, w, h })
+                });
+                const res = await response.json();
+                if (res.status === 'success') {
+                    log('🚀 物体跟踪已启动！后端锁死目标', 'success');
+                    // 更新界面中心显示
+                    document.getElementById('boxCenterX').textContent = `${Math.round(x + w/2)} px`;
+                    document.getElementById('boxCenterY').textContent = `${Math.round(y + h/2)} px`;
+                } else {
+                    log('启动跟踪失败: ' + (res.reason || '未知错误'), 'error');
+                }
+            } catch (e) {
+                log('请求物体跟踪接口失败', 'error');
+            }
+        }
+
+        // ---------- 鼠标事件（框选 + 手动拖拽控制） ----------
+        function calculateMouseSpeed(clickX, clickY, width, height) {
+            let rawYaw = (clickX / width - 0.5) * 300;
+            let rawPitch = (0.5 - clickY / height) * 300; 
+            mouseCurrentYawSpeed = Math.max(-100, Math.min(100, Math.round(rawYaw)));
+            mouseCurrentPitchSpeed = Math.max(-100, Math.min(100, Math.round(rawPitch)));
+            if (Math.abs(mouseCurrentYawSpeed) < 5) mouseCurrentYawSpeed = 0;
+            if (Math.abs(mouseCurrentPitchSpeed) < 5) mouseCurrentPitchSpeed = 0;
+        }
+
+        canvas.addEventListener('mousedown', (e) => {
+            if (!serviceRunning) return;
+            const rect = canvas.getBoundingClientRect();
+            const clientX = e.clientX - rect.left;
+            const clientY = e.clientY - rect.top;
+
+            if (isRoiModeActive) {
+                startCanvasX = clientX;
+                startCanvasY = clientY;
+                currentCanvasX = clientX;
+                currentCanvasY = clientY;
+                isDrawing = true;
+            } else if (manualMode) {
+                isMouseGimbalInteracting = true;
+                calculateMouseSpeed(clientX, clientY, rect.width, rect.height);
+                if (mouseLoopInterval) clearInterval(mouseLoopInterval);
+                sendGimbal(mouseCurrentYawSpeed, mouseCurrentPitchSpeed);
+                mouseLoopInterval = setInterval(() => {
+                    if (isMouseGimbalInteracting) sendGimbal(mouseCurrentYawSpeed, mouseCurrentPitchSpeed);
+                }, 50);
+            }
+        });
+
+        canvas.addEventListener('mousemove', (e) => {
+            const rect = canvas.getBoundingClientRect();
+            const clientX = e.clientX - rect.left;
+            const clientY = e.clientY - rect.top;
+
+            if (isDrawing) {
+                currentCanvasX = clientX;
+                currentCanvasY = clientY;
+                renderCanvasLayers();
+            } else if (isMouseGimbalInteracting && manualMode) {
+                calculateMouseSpeed(clientX, clientY, rect.width, rect.height);
+            }
+        });
+
+        function terminateMouseControl() {
+            if (isMouseGimbalInteracting) {
+                isMouseGimbalInteracting = false;
+                if (mouseLoopInterval) { clearInterval(mouseLoopInterval); mouseLoopInterval = null; }
+                sendGimbal(0, 0);
+                log('🛑 鼠标已释放，自动刹车', 'success');
+            }
+        }
+
+        canvas.addEventListener('mouseup', (e) => {
+            if (isDrawing) {
+                isDrawing = false;
+                const canvasW = currentCanvasX - startCanvasX;
+                const canvasH = currentCanvasY - startCanvasY;
+
+                if (Math.abs(canvasW) < 8 || Math.abs(canvasH) < 8) {
+                    renderCanvasLayers();
+                    return;
+                }
+
+                // 保存画布坐标的选框（用于重绘）
+                savedRoi = {
+                    x: Math.min(startCanvasX, currentCanvasX),
+                    y: Math.min(startCanvasY, currentCanvasY),
+                    w: Math.abs(canvasW),
+                    h: Math.abs(canvasH)
+                };
+
+                // 提交到后端启动跟踪
+                submitRoiToBackend(savedRoi.x, savedRoi.y, savedRoi.w, savedRoi.h);
+
+                // 退出框选模式
+                isRoiModeActive = false;
+                canvas.style.cursor = 'default';
+                document.getElementById('btnSelectRoi').classList.remove('btn-active-hunting');
+                renderCanvasLayers();
+            } else {
+                terminateMouseControl();
+            }
+        });
+
+        canvas.addEventListener('mouseleave', terminateMouseControl);
+        
+        // 双击清除选框并停止跟踪
+        canvas.addEventListener('dblclick', (e) => {
+            if (savedRoi) {
+                clearRoiSelection();
+            }
+        });
+
+        // ---------- 云台控制通信 ----------
+        async function sendGimbal(yaw, pitch) {
+            yaw = Math.max(-100, Math.min(100, parseInt(yaw || 0)));
+            pitch = Math.max(-100, Math.min(100, parseInt(pitch || 0)));
+            try {
+                const response = await fetch('/api/gimbal/control', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ yaw, pitch })
+                });
+                const result = await response.json();
+                if (result.status === 'success') {
+                    document.getElementById('statusYaw').textContent = yaw;
+                    document.getElementById('statusPitch').textContent = pitch;
+                }
+            } catch (error) {
+                console.error(`云台调向同步失败: ${error.message}`);
+            }
+        }
+        
+        function centerGimbal() {
+            log('🎯 云台急停回中', 'success');
+            sendGimbal(0, 0);
+        }
+        
+        function toggleMode() {
+            manualMode = !manualMode;
+            updateModeIndicator();
+            // 切到手动时，如果正在物体跟踪，建议清除选框（不强制停止，后端会压制）
+            log(`🔄 切换到 ${manualMode ? '手动控制' : '自动跟踪'} 模式`, 'info');
+        }
+        
+        function updateModeIndicator() {
+            const el = document.getElementById('modeIndicator');
+            // 实际模式由后端状态决定，此处仅展示前端手动/自动意图
+            el.className = `mode-indicator ${manualMode ? 'mode-manual' : 'mode-auto'}`;
+            el.textContent = manualMode ? '🎮 手动控制模式' : '🤖 自动跟踪模式';
+        }
+
+        // 定期从后端获取真实模式并更新UI
+        setInterval(async () => {
+            try {
+                const res = await fetch('/api/status');
+                const data = await res.json();
+                const mode = data.system_mode; // 'auto_face', 'object_track', 'manual'
+                const el = document.getElementById('modeIndicator');
+                let modeText = '';
+                let className = 'mode-indicator ';
+                if (mode === 'manual') {
+                    modeText = '🎮 手动控制';
+                    className += 'mode-manual';
+                    manualMode = true;
+                } else if (mode === 'object_track') {
+                    modeText = '🎯 物体跟踪';
+                    className += 'mode-object';
+                    manualMode = false;
+                } else { // auto_face
+                    modeText = '🤖 自动人脸跟踪';
+                    className += 'mode-auto';
+                    manualMode = false;
+                }
+                el.className = className;
+                el.textContent = modeText;
+            } catch(e) {}
+        }, 2000);
+        
+        function updateConnectionStatus(online, msg = '') {
+            const el = document.getElementById('connStatus');
+            el.className = `connection-status ${online ? 'conn-ok' : 'conn-error'}`;
+            el.textContent = online ? '🟢 已连接 ' + msg : '🔴 未连接 ' + msg;
+        }
+        
+        function startService() {
+            const ip = document.getElementById('cameraIp').value;
+            const port = document.getElementById('udpPort').value;
+            serviceRunning = true; manualMode = true; updateModeIndicator();
+            
+            document.getElementById('btnStart').disabled = true;
+            document.getElementById('btnStop').disabled = false;
+            document.getElementById('mainStatus').textContent = '● 运行中';
+            document.getElementById('mainStatus').style.color = '#00ff88';
+            document.getElementById('displayCameraIp').textContent = ip;
+            document.getElementById('displayUdpPort').textContent = port;
+            
+            log('🚀 服务启动成功', 'success');
+            updateConnectionStatus(true, ip);
+            initWebSocket();
+            centerGimbal();
+            startKeyboardControl();
+        }
+        
+        function stopService() {
+            serviceRunning = false;
+            if (ws) { ws.close(); ws = null; }
+            if (controlInterval) clearInterval(controlInterval);
+            if (mouseLoopInterval) clearInterval(mouseLoopInterval);
+            isMouseGimbalInteracting = false;
+            
+            document.getElementById('btnStart').disabled = false;
+            document.getElementById('btnStop').disabled = true;
+            document.getElementById('mainStatus').textContent = '已停止';
+            document.getElementById('mainStatus').style.color = '#ff6b6b';
+            
+            clearRoiSelection(); centerGimbal();
+            log('⏹ 系统安全停机', 'warning');
+            updateConnectionStatus(false);
+        }
+        
+        async function testConnection() {
+            const bStatus = document.getElementById('backendStatus');
+            try {
+                const response = await fetch('/api/status');
+                const data = await response.json();
+                if (data) {
+                    log('✅ 核心后端链路在线', 'success');
+                    updateConnectionStatus(true, '链路就绪');
+                    bStatus.textContent = '正常'; bStatus.style.color = '#00ff88';
+                }
+            } catch (error) {
+                log('❌ 连接失败，请检查服务后端', 'error');
+                updateConnectionStatus(false, '离线');
+                bStatus.textContent = '离线'; bStatus.style.color = '#ff6b6b';
+            }
+        }
+        
+        function startKeyboardControl() {
+            document.addEventListener('keydown', (e) => {
+                keysPressed[e.key.toLowerCase()] = true;
+                if (e.key.toLowerCase() === 't') toggleMode();
+                if (e.code === 'Space') { e.preventDefault(); centerGimbal(); }
+                if (e.key.toLowerCase() === 'q' && serviceRunning) stopService();
+            });
+            document.addEventListener('keyup', (e) => { keysPressed[e.key.toLowerCase()] = false; });
+            
+            controlInterval = setInterval(() => {
+                if (!serviceRunning || !manualMode || isMouseGimbalInteracting) return;
+                const speed = keysPressed['shift'] ? 100 : 50;
+                let yaw = 0, pitch = 0;
+                if (keysPressed['w'] || keysPressed['arrowup']) pitch = speed;
+                if (keysPressed['s'] || keysPressed['arrowdown']) pitch = -speed;
+                if (keysPressed['a'] || keysPressed['arrowleft']) yaw = -speed;
+                if (keysPressed['d'] || keysPressed['arrowright']) yaw = speed;
+                
+                if (yaw !== 0 || pitch !== 0) sendGimbal(yaw, pitch);
+            }, 50);
+        }
+        
+        window.addEventListener('load', () => {
+            log('系统初始化完成', 'success');
+            setTimeout(testConnection, 1000);
+        });
+    </script>
+</body>
+</html>

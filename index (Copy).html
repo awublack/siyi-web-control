@@ -1,0 +1,598 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SIYI A8 Mini 云台控制</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            min-height: 100vh;
+            color: #fff;
+            padding: 20px;
+        }
+        .container { max-width: 1200px; margin: 0 auto; }
+        h1 {
+            text-align: center;
+            margin-bottom: 30px;
+            color: #00d9ff;
+            text-shadow: 0 0 20px rgba(0, 217, 255, 0.5);
+        }
+        .main-grid {
+            display: grid;
+            grid-template-columns: 1fr 350px;
+            gap: 20px;
+        }
+        .video-section {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 15px;
+            padding: 20px;
+            backdrop-filter: blur(10px);
+        }
+        .video-container {
+            position: relative;
+            width: 100%;
+            aspect-ratio: 4/3;
+            background: linear-gradient(135deg, #0f3460 0%, #16213e 100%);
+            border-radius: 10px;
+            overflow: hidden;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        #videoStream {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            display: none;
+        }
+        .status-overlay {
+            text-align: center;
+            padding: 20px;
+        }
+        .status-overlay h2 {
+            font-size: 24px;
+            margin-bottom: 10px;
+            color: #00d9ff;
+        }
+        .status-item {
+            margin: 10px 0;
+            font-size: 16px;
+        }
+        .status-value {
+            color: #00ff88;
+            font-weight: bold;
+        }
+        .control-panel {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 15px;
+            padding: 20px;
+            backdrop-filter: blur(10px);
+        }
+        .status-card {
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 10px;
+            padding: 15px;
+            margin-bottom: 15px;
+            border-left: 4px solid #00d9ff;
+        }
+        .status-item-row {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 8px;
+            font-size: 14px;
+        }
+        .status-label { color: #aaa; }
+        .status-value { font-weight: bold; color: #00d9ff; }
+        .mode-indicator {
+            padding: 12px 15px;
+            border-radius: 8px;
+            text-align: center;
+            font-weight: bold;
+            margin-bottom: 15px;
+            transition: all 0.3s ease;
+        }
+        .mode-auto {
+            background: linear-gradient(135deg, #00b894, #00cec9);
+            color: #fff;
+        }
+        .mode-manual {
+            background: linear-gradient(135deg, #fd79a8, #e84393);
+            color: #fff;
+        }
+        .control-buttons {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+        .btn {
+            padding: 14px 20px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: bold;
+            font-size: 14px;
+            transition: all 0.2s ease;
+        }
+        .btn-primary {
+            background: linear-gradient(135deg, #00d9ff, #0077b6);
+            color: #fff;
+        }
+        .btn-danger {
+            background: linear-gradient(135deg, #ff6b6b, #ee5a5a);
+            color: #fff;
+        }
+        .btn-success {
+            background: linear-gradient(135deg, #51cf66, #37b24d);
+            color: #fff;
+        }
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(0, 0, 0, 0.3);
+        }
+        .btn:active { transform: translateY(0); }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        
+        .keyboard-help {
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 10px;
+            padding: 15px;
+            margin-top: 15px;
+        }
+        .keyboard-help h3 {
+            margin-bottom: 10px;
+            color: #00d9ff;
+            font-size: 14px;
+        }
+        .key-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 6px 0;
+            font-size: 13px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        .key-row:last-child { border-bottom: none; }
+        .key {
+            background: rgba(255, 255, 255, 0.15);
+            padding: 3px 10px;
+            border-radius: 4px;
+            font-family: monospace;
+            font-size: 12px;
+        }
+        .log-container {
+            background: rgba(0, 0, 0, 0.5);
+            border-radius: 8px;
+            padding: 10px;
+            height: 180px;
+            overflow-y: auto;
+            font-family: monospace;
+            font-size: 11px;
+            margin-top: 15px;
+        }
+        .log-entry { margin-bottom: 3px; padding: 2px 4px; }
+        .log-info { color: #00d9ff; }
+        .log-success { color: #51cf66; }
+        .log-warning { color: #ffd43b; }
+        .log-error { color: #ff6b6b; }
+        
+        .settings-section { margin-top: 15px; }
+        .setting-item { margin-bottom: 12px; }
+        .setting-label {
+            display: block;
+            margin-bottom: 5px;
+            font-size: 12px;
+            color: #aaa;
+        }
+        .setting-input {
+            width: 100%;
+            padding: 8px 10px;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 6px;
+            background: rgba(0, 0, 0, 0.3);
+            color: #fff;
+            font-size: 13px;
+        }
+        .setting-input:focus {
+            outline: none;
+            border-color: #00d9ff;
+        }
+        
+        .connection-status {
+            padding: 10px;
+            border-radius: 8px;
+            margin-bottom: 15px;
+            text-align: center;
+            font-weight: bold;
+            font-size: 14px;
+        }
+        .conn-ok {
+            background: rgba(81, 207, 102, 0.2);
+            border: 1px solid #51cf66;
+            color: #51cf66;
+        }
+        .conn-error {
+            background: rgba(255, 107, 107, 0.2);
+            border: 1px solid #ff6b6b;
+            color: #ff6b6b;
+        }
+        
+        @media (max-width: 900px) {
+            .main-grid { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎯 SIYI A8 Mini 云台控制系统</h1>
+        
+        <div class="main-grid">
+            <div class="video-section">
+                <div class="video-container" id="videoContainer">
+                    <img id="videoStream" alt="Video Stream">
+                    <div class="status-overlay" id="videoOverlay">
+                        <h2>📡 控制系统就绪</h2>
+                        <div class="status-item">相机 IP: <span class="status-value" id="displayCameraIp">192.168.144.25</span></div>
+                        <div class="status-item">UDP 端口：<span class="status-value" id="displayUdpPort">37260</span></div>
+                        <div class="status-item">状态：<span class="status-value" id="mainStatus">等待启动...</span></div>
+                    </div>
+                </div>
+                <div class="log-container" id="logContainer"></div>
+            </div>
+            
+            <div class="control-panel">
+                <div class="connection-status conn-error" id="connStatus">
+                    🔴 未连接
+                </div>
+                
+                <div class="mode-indicator mode-auto" id="modeIndicator">
+                    🤖 自动跟踪模式
+                </div>
+                
+                <div class="status-card">
+                    <div class="status-item-row">
+                        <span class="status-label">云台 Yaw</span>
+                        <span class="status-value" id="statusYaw">0</span>
+                    </div>
+                    <div class="status-item-row">
+                        <span class="status-label">云台 Pitch</span>
+                        <span class="status-value" id="statusPitch">0</span>
+                    </div>
+                    <div class="status-item-row">
+                        <span class="status-label">后端服务</span>
+                        <span class="status-value" id="backendStatus">检查中...</span>
+                    </div>
+                </div>
+                
+                <div class="control-buttons">
+                    <button class="btn btn-success" id="btnStart" onclick="startService()">▶ 启动服务</button>
+                    <button class="btn btn-primary" onclick="centerGimbal()">🎯 回中</button>
+                    <button class="btn btn-primary" onclick="toggleMode()">🔄 切换模式</button>
+                    <button class="btn btn-danger" id="btnStop" onclick="stopService()" disabled>⏹ 停止</button>
+                </div>
+                
+                <div class="settings-section">
+                    <div class="setting-item">
+                        <label class="setting-label">摄像头 IP</label>
+                        <input type="text" class="setting-input" id="cameraIp" value="192.168.144.25">
+                    </div>
+                    <div class="setting-item">
+                        <label class="setting-label">UDP 端口</label>
+                        <input type="number" class="setting-input" id="udpPort" value="37260">
+                    </div>
+                    <button class="btn btn-primary" style="width: 100%; margin-top: 10px;" onclick="testConnection()">🔍 测试连接</button>
+                </div>
+                
+                <div class="keyboard-help">
+                    <h3>⌨️ 键盘控制</h3>
+                    <div class="key-row">
+                        <span><span class="key">W</span> 向上</span>
+                        <span><span class="key">S</span> 向下</span>
+                    </div>
+                    <div class="key-row">
+                        <span><span class="key">A</span> 向左</span>
+                        <span><span class="key">D</span> 向右</span>
+                    </div>
+                    <div class="key-row">
+                        <span><span class="key">Shift</span> 加速</span>
+                        <span><span class="key">Space</span> 回中</span>
+                    </div>
+                    <div class="key-row">
+                        <span><span class="key">T</span> 切换模式</span>
+                        <span><span class="key">Q</span> 停止</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // ==================== 全局变量 ====================
+        let manualMode = false;
+        let serviceRunning = false;
+        let controlInterval = null;
+        let ws = null;
+        const keysPressed = {};
+        
+        // ==================== 日志功能 ====================
+        function log(message, type = 'info') {
+            const logContainer = document.getElementById('logContainer');
+            const entry = document.createElement('div');
+            entry.className = `log-entry log-${type}`;
+            const time = new Date().toLocaleTimeString();
+            entry.textContent = `[${time}] ${message}`;
+            logContainer.appendChild(entry);
+            logContainer.scrollTop = logContainer.scrollHeight;
+            if (logContainer.children.length > 100) {
+                logContainer.removeChild(logContainer.firstChild);
+            }
+        }
+        
+        // ==================== 视频流处理 ====================
+        function initWebSocket() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${window.location.host}/api/ws`;
+            
+            if (ws) {
+                ws.close();
+            }
+            
+            log('🔌 正在连接视频流...', 'info');
+            ws = new WebSocket(wsUrl);
+            ws.binaryType = 'blob';
+            
+            ws.onopen = () => {
+                log('✅ 视频流已连接', 'success');
+                document.getElementById('videoStream').style.display = 'block';
+                document.getElementById('videoOverlay').style.display = 'none';
+            };
+            
+            ws.onmessage = (event) => {
+                if (event.data instanceof Blob) {
+                    const url = URL.createObjectURL(event.data);
+                    const img = document.getElementById('videoStream');
+                    const oldUrl = img.src;
+                    img.src = url;
+                    if (oldUrl) URL.revokeObjectURL(oldUrl);
+                }
+            };
+            
+            ws.onclose = () => {
+                log('❌ 视频流连接断开', 'error');
+                document.getElementById('videoStream').style.display = 'none';
+                document.getElementById('videoOverlay').style.display = 'block';
+                if (serviceRunning) {
+                    setTimeout(initWebSocket, 2000); // 自动重连
+                }
+            };
+            
+            ws.onerror = (error) => {
+                log('视频流错误', 'error');
+            };
+        }
+
+        // ==================== 云台控制 ====================
+        async function sendGimbal(yaw, pitch) {
+            yaw = Math.max(-100, Math.min(100, parseInt(yaw)));
+            pitch = Math.max(-100, Math.min(100, parseInt(pitch)));
+            
+            const cameraIp = document.getElementById('cameraIp').value;
+            const udpPort = parseInt(document.getElementById('udpPort').value);
+            
+            try {
+                const response = await fetch('/api/gimbal/control', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ yaw, pitch, ip: cameraIp, port: udpPort })
+                });
+                const result = await response.json();
+                if (result.status === 'success') {
+                    updateStatus(yaw, pitch);
+                } else {
+                    log(`控制失败：${result.message}`, 'error');
+                }
+            } catch (error) {
+                log(`控制错误：${error.message}`, 'error');
+            }
+        }
+        
+        async function sendGimbalAngle(yawAngle, pitchAngle) {
+            yawAngle = Math.max(-36000, Math.min(36000, parseInt(yawAngle)));
+            pitchAngle = Math.max(-36000, Math.min(36000, parseInt(pitchAngle)));
+            
+            const cameraIp = document.getElementById('cameraIp').value;
+            
+            try {
+                await fetch('/api/gimbal/angle', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ yaw: yawAngle, pitch: pitchAngle, ip: cameraIp })
+                });
+            } catch (error) {
+                console.log('角度控制:', yawAngle, pitchAngle);
+            }
+        }
+        
+        function centerGimbal() {
+            log('🎯 云台回中', 'success');
+            sendGimbal(0, 0);
+            setTimeout(() => {
+                for (let i = 0; i < 3; i++) {
+                    setTimeout(() => sendGimbal(0, 0), i * 100);
+                }
+            }, 100);
+        }
+        
+        function toggleMode() {
+            manualMode = !manualMode;
+            updateModeIndicator();
+            const modeStr = manualMode ? '手动控制' : '自动跟踪';
+            log(`🔄 切换到${modeStr}模式`, 'info');
+        }
+        
+        function updateModeIndicator() {
+            const indicator = document.getElementById('modeIndicator');
+            if (manualMode) {
+                indicator.className = 'mode-indicator mode-manual';
+                indicator.textContent = '🎮 手动控制模式';
+            } else {
+                indicator.className = 'mode-indicator mode-auto';
+                indicator.textContent = '🤖 自动跟踪模式';
+            }
+        }
+        
+        function updateStatus(yaw, pitch) {
+            document.getElementById('statusYaw').textContent = yaw;
+            document.getElementById('statusPitch').textContent = pitch;
+        }
+        
+        function updateConnectionStatus(online, message = '') {
+            const el = document.getElementById('connStatus');
+            if (online) {
+                el.className = 'connection-status conn-ok';
+                el.textContent = '🟢 已连接 ' + message;
+            } else {
+                el.className = 'connection-status conn-error';
+                el.textContent = '🔴 未连接 ' + message;
+            }
+        }
+        
+        // ==================== 服务控制 ====================
+        function startService() {
+            const cameraIp = document.getElementById('cameraIp').value;
+            const udpPort = document.getElementById('udpPort').value;
+            
+            serviceRunning = true;
+            manualMode = true; // 启动时默认手动模式
+            updateModeIndicator();
+            
+            document.getElementById('btnStart').disabled = true;
+            document.getElementById('btnStop').disabled = false;
+            document.getElementById('mainStatus').textContent = '● 运行中';
+            document.getElementById('mainStatus').style.color = '#00ff88';
+            document.getElementById('displayCameraIp').textContent = cameraIp;
+            document.getElementById('displayUdpPort').textContent = udpPort;
+            
+            log('🚀 服务已启动', 'success');
+            log(`目标：${cameraIp}:${udpPort}`, 'info');
+            
+            updateConnectionStatus(true, `${cameraIp}`);
+            
+            // 初始化视频流
+            initWebSocket();
+            
+            // 初始化云台（回中）
+            centerGimbal();
+            
+            // 开始键盘监听
+            startKeyboardControl();
+        }
+        
+        function stopService() {
+            serviceRunning = false;
+            
+            if (ws) {
+                ws.close();
+                ws = null;
+            }
+            
+            if (controlInterval) {
+                clearInterval(controlInterval);
+            }
+            
+            document.getElementById('btnStart').disabled = false;
+            document.getElementById('btnStop').disabled = true;
+            document.getElementById('mainStatus').textContent = '已停止';
+            document.getElementById('mainStatus').style.color = '#ff6b6b';
+            
+            // 回中云台
+            centerGimbal();
+            
+            log('⏹ 服务已停止', 'warning');
+            updateConnectionStatus(false);
+        }
+        
+        async function testConnection() {
+            const cameraIp = document.getElementById('cameraIp').value;
+            log(`🔍 测试连接到 ${cameraIp}...`, 'info');
+            
+            try {
+                const response = await fetch('/api/status');
+                const data = await response.json();
+                
+                if (data) {
+                    log('✅ 后端服务正常', 'success');
+                    log(`相机 IP: ${data.camera_ip || cameraIp}`, 'info');
+                    updateConnectionStatus(true, '后端正常');
+                    document.getElementById('backendStatus').textContent = '正常';
+                    document.getElementById('backendStatus').style.color = '#00ff88';
+                }
+            } catch (error) {
+                log(`❌ 后端服务未响应：${error.message}`, 'error');
+                updateConnectionStatus(false, '后端离线');
+                document.getElementById('backendStatus').textContent = '离线';
+                document.getElementById('backendStatus').style.color = '#ff6b6b';
+            }
+        }
+        
+        // ==================== 键盘控制 ====================
+        function startKeyboardControl() {
+            document.addEventListener('keydown', (e) => {
+                keysPressed[e.key.toLowerCase()] = true;
+                
+                if (e.key.toLowerCase() === 't') {
+                    toggleMode();
+                }
+                
+                if (e.code === 'Space') {
+                    e.preventDefault();
+                    centerGimbal();
+                }
+                
+                if (e.key.toLowerCase() === 'q') {
+                    if (serviceRunning) {
+                        stopService();
+                    }
+                }
+            });
+            
+            document.addEventListener('keyup', (e) => {
+                keysPressed[e.key.toLowerCase()] = false;
+            });
+            
+            // 控制循环（每 50ms 执行一次）
+            controlInterval = setInterval(() => {
+                if (!serviceRunning || !manualMode) return;
+                
+                const boost = keysPressed['shift'];
+                const speed = boost ? 100 : 50;
+                
+                let yaw = 0, pitch = 0;
+                const direction = [];
+                
+                if (keysPressed['w']) { pitch = speed; direction.push('上'); }
+                if (keysPressed['s']) { pitch = -speed; direction.push('下'); }
+                if (keysPressed['a']) { yaw = -speed; direction.push('左'); }
+                if (keysPressed['d']) { yaw = speed; direction.push('右'); }
+                
+                if (yaw !== 0 || pitch !== 0) {
+                    sendGimbal(yaw, pitch);
+                }
+            }, 50);
+        }
+        
+        // ==================== 初始化 ====================
+        window.addEventListener('load', () => {
+            log('系统初始化完成', 'success');
+            log('点击"启动服务"开始控制云台', 'info');
+            
+            // 检查后端状态
+            setTimeout(() => {
+                testConnection();
+            }, 1000);
+        });
+    </script>
+</body>
+</html>
