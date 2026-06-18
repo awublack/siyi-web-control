@@ -46,7 +46,13 @@
         .log-info { color: #00d9ff; } .log-success { color: #51cf66; } .log-warning { color: #ffd43b; } .log-error { color: #ff6b6b; }
         .setting-item { margin-bottom: 12px; }
         .setting-label { display: block; margin-bottom: 5px; font-size: 12px; color: #aaa; }
-        .setting-input { width: 100%; padding: 8px 10px; border: 1px solid rgba(255, 255, 255, 0.2); border-radius: 6px; background: rgba(0, 0, 0, 0.3); color: #fff; }
+        .setting-input { 
+            width: 100%; padding: 8px 10px; border: 1px solid rgba(255, 255, 255, 0.2); border-radius: 6px; 
+            background: rgba(0, 0, 0, 0.3); color: #fff; appearance: none; -webkit-appearance: none;
+            background-image: url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2300d9ff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3e%3cpolyline points='6 9 12 15 18 9'%3e%3c/polyline%3e%3c/svg%3e");
+            background-repeat: no-repeat; background-position: right 10px center; background-size: 16px; padding-right: 30px;
+        }
+        .setting-input option { background: #16213e; color: #fff; }
         .connection-status { padding: 10px; border-radius: 8px; margin-bottom: 15px; text-align: center; font-weight: bold; }
         .conn-ok { background: rgba(81, 207, 102, 0.2); border: 1px solid #51cf66; color: #51cf66; }
         .conn-error { background: rgba(255, 107, 107, 0.2); border: 1px solid #ff6b6b; color: #ff6b6b; }
@@ -76,6 +82,8 @@
                 <div class="status-card">
                     <div class="status-item-row"><span class="status-label">云台 Yaw</span><span class="status-value" id="statusYaw">0</span></div>
                     <div class="status-item-row"><span class="status-label">云台 Pitch</span><span class="status-value" id="statusPitch">0</span></div>
+                    <div class="status-item-row"><span class="status-label">当前检测器</span><span class="status-value" id="currentDetector" style="color:#ffd43b">-</span></div>
+                    <div class="status-item-row"><span class="status-label">当前跟踪器</span><span class="status-value" id="currentTracker" style="color:#ff7f50">-</span></div>
                     <div class="status-item-row"><span class="status-label">框选中心 X</span><span class="status-value" id="boxCenterX" style="color:#00ff88">-</span></div>
                     <div class="status-item-row"><span class="status-label">框选中心 Y</span><span class="status-value" id="boxCenterY" style="color:#00ff88">-</span></div>
                 </div>
@@ -91,6 +99,28 @@
                 <div class="setting-item">
                     <label class="setting-label">摄像头 IP (仅作显示参考)</label>
                     <input type="text" class="setting-input" id="cameraIp" value="192.168.144.25" readonly>
+                </div>
+                
+                <div class="setting-item">
+                    <label class="setting-label">人脸检测算法 (切换后立刻生效)</label>
+                    <select class="setting-input" id="detectorSelect" onchange="switchDetector()">
+                        <option value="haar">Haar Cascade (极速/基础)</option>
+                        <option value="lbp">LBP Cascade (抗光照)</option>
+                        <option value="dnn">DNN YuNet (高精度/推荐)</option>
+                    </select>
+                </div>
+                
+                <div class="setting-item">
+                    <label class="setting-label">物体跟踪算法 (切换后立刻生效)</label>
+                    <select class="setting-input" id="trackerSelect" onchange="switchTracker()">
+                        <!-- 核心修改：新增 Hybrid 选项并设为默认 -->
+                        <option value="hybrid" selected>Hybrid (MOSSE+CSRT 融合/强烈推荐)</option>
+                        <option value="mosse">MOSSE (极速/易漂移)</option>
+                        <option value="kcf">KCF (平衡)</option>
+                        <option value="csrt">CSRT (高精度/可能卡顿)</option>
+                        <option value="dasiamrpn">DaSiamRPN (深度学习/极高精度)</option>
+                        <option value="ssd">SSD (全局检测/防漂移)</option>
+                    </select>
                 </div>
                 
                 <div class="keyboard-help">
@@ -174,7 +204,6 @@
 
         function renderCanvasLayers() {
             ctx.clearRect(0, 0, canvas.width, canvas.height);
-            // 正在拖动时，画虚线框
             if (isDrawing) {
                 ctx.strokeStyle = '#00ff88';
                 ctx.lineWidth = 2;
@@ -182,8 +211,6 @@
                 ctx.strokeRect(startX, startY, currentX - startX, currentY - startY);
                 ctx.setLineDash([]); 
             }
-            // 核心修改：只有当 savedRoi 存在时才画绿色实线框
-            // 框选完成后我们会立刻将其置为 null，从而让绿框消失
             if (savedRoi) {
                 ctx.strokeStyle = '#00ff88';
                 ctx.lineWidth = 3;
@@ -212,6 +239,62 @@
                 await fetch('/api/tracker/reset', { method: 'POST' }); 
                 log('🔄 已停止跟踪，进入待机状态', 'info');
             } catch (e) {}
+        }
+
+        async function switchDetector() {
+            const select = document.getElementById('detectorSelect');
+            const method = select.value;
+            try {
+                const response = await fetch('/api/detector/switch', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ method: method })
+                });
+                const res = await response.json();
+                if (res.status === 'success') {
+                    const isDowngraded = (method === 'dnn' && !res.active_method.includes('dnn')) || 
+                                         (method === 'lbp' && res.active_method !== 'lbp');
+                    if (!isDowngraded) {
+                        log(`✅ 检测器已切换为: ${res.active_method.toUpperCase()}`, 'success');
+                    } else {
+                        log(`⚠️ 请求 ${method.toUpperCase()} 失败(可能缺少模型)，已自动降级为: ${res.active_method.toUpperCase()}`, 'warning');
+                        if (res.active_method.includes('dnn')) select.value = 'dnn';
+                        else if (res.active_method === 'lbp') select.value = 'lbp';
+                        else select.value = 'haar';
+                    }
+                } else {
+                    log(`❌ 切换失败: ${res.reason}`, 'error');
+                }
+            } catch (e) {
+                log('❌ 切换检测器请求失败', 'error');
+            }
+        }
+
+        async function switchTracker() {
+            const select = document.getElementById('trackerSelect');
+            const method = select.value;
+            try {
+                const response = await fetch('/api/tracker/switch', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ method: method })
+                });
+                const res = await response.json();
+                if (res.status === 'success') {
+                    const actual = res.active_method;
+                    const isDowngraded = (method !== actual);
+                    if (!isDowngraded) {
+                        log(`✅ 物体跟踪器已切换为: ${actual.toUpperCase()}`, 'success');
+                    } else {
+                        log(`⚠️ 请求 ${method.toUpperCase()} 失败，已自动降级为: ${actual.toUpperCase()}`, 'warning');
+                        select.value = actual;
+                    }
+                } else {
+                    log(`❌ 切换跟踪器失败: ${res.reason}`, 'error');
+                }
+            } catch (e) {
+                log('❌ 切换物体跟踪器请求失败', 'error');
+            }
         }
 
         function calculateMouseSpeed(clickX, clickY, width, height) {
@@ -274,21 +357,15 @@
 
                 if (finalW < 10 || finalH < 10) return renderCanvasLayers();
 
-                // 更新右侧状态栏的坐标显示
                 document.getElementById('boxCenterX').textContent = `${Math.round(finalX + finalW / 2)} px`;
                 document.getElementById('boxCenterY').textContent = `${Math.round(finalY + finalH / 2)} px`;
 
-                // 将坐标提交给后端
                 submitRoiToBackend(finalX/rect.width, finalY/rect.height, finalW/rect.width, finalH/rect.height);
-                
-                // 核心修改：提交后立刻清空 savedRoi，让前端的绿色选框瞬间消失！
-                // 后续画面完全由后端视频流上的跟踪框接管，避免两个框重叠。
                 savedRoi = null; 
-                
                 isRoiModeActive = false;
                 canvas.style.cursor = 'default';
                 document.getElementById('btnSelectRoi').classList.remove('btn-active-hunting');
-                renderCanvasLayers(); // 重新渲染，此时绿框已消失
+                renderCanvasLayers();
             } else {
                 terminateMouseControl();
             }
@@ -304,7 +381,7 @@
                     body: JSON.stringify({ x, y, width: w, height: h })
                 });
                 const res = await response.json();
-                if (res.status === 'success') log('🚀 目标已锁定，后端正在智能识别...', 'success');
+                if (res.status === 'success') log('🚀 已发送框选坐标，后端正在初始化跟踪器...', 'success');
             } catch (e) {
                 log('后端初始化失败', 'error');
             }
@@ -341,7 +418,6 @@
             document.getElementById('btnStop').disabled = false;
             document.getElementById('mainStatus').textContent = '● 运行中';
             document.getElementById('mainStatus').style.color = '#00ff88';
-            
             log('🚀 服务启动成功，当前处于待机状态', 'success');
             updateConnectionStatus(true);
             initWebSocket();
@@ -355,12 +431,10 @@
             if (controlInterval) clearInterval(controlInterval);
             if (mouseLoopInterval) clearInterval(mouseLoopInterval);
             isMouseGimbalInteracting = false;
-            
             document.getElementById('btnStart').disabled = false;
             document.getElementById('btnStop').disabled = true;
             document.getElementById('mainStatus').textContent = '已停止';
             document.getElementById('mainStatus').style.color = '#ff6b6b';
-            
             resetTracking();
             log('⏹ 系统安全停机', 'warning');
             updateConnectionStatus(false);
@@ -372,7 +446,6 @@
                 if (e.code === 'Space') { e.preventDefault(); centerGimbal(); }
             });
             document.addEventListener('keyup', (e) => { keysPressed[e.key.toLowerCase()] = false; });
-            
             controlInterval = setInterval(() => {
                 if (!serviceRunning || isMouseGimbalInteracting) return;
                 const speed = keysPressed['shift'] ? 100 : 50;
@@ -381,7 +454,6 @@
                 if (keysPressed['s']) pitch = -speed;
                 if (keysPressed['a']) yaw = -speed;
                 if (keysPressed['d']) yaw = speed;
-                
                 if (yaw !== 0 || pitch !== 0) sendGimbal(yaw, pitch);
             }, 50);
         }
@@ -407,6 +479,28 @@
                         modeEl.textContent = '⏸️ 待机中 (请框选目标)';
                         modeEl.className = 'mode-indicator mode-idle';
                     }
+                }
+                
+                const detectorEl = document.getElementById('currentDetector');
+                if (detectorEl && data.detector_type) {
+                    let displayType = data.detector_type.toUpperCase();
+                    if (data.detector_type.includes('dnn')) displayType = 'DNN (高精度)';
+                    else if (data.detector_type === 'lbp') displayType = 'LBP';
+                    else if (data.detector_type === 'haar') displayType = 'Haar';
+                    detectorEl.textContent = displayType;
+                }
+
+                // 核心修改：增加对 Hybrid 的显示支持
+                const trackerEl = document.getElementById('currentTracker');
+                if (trackerEl && data.tracker_type) {
+                    let displayTracker = data.tracker_type.toUpperCase();
+                    if (data.tracker_type === 'hybrid') displayTracker = 'Hybrid (融合跟踪)';
+                    else if (data.tracker_type === 'dasiamrpn') displayTracker = 'DaSiamRPN (深度学习)';
+                    else if (data.tracker_type === 'ssd') displayTracker = 'SSD (全局检测)';
+                    else if (data.tracker_type === 'csrt') displayTracker = 'CSRT (高精度)';
+                    else if (data.tracker_type === 'kcf') displayTracker = 'KCF (平衡)';
+                    else if (data.tracker_type === 'mosse') displayTracker = 'MOSSE (极速)';
+                    trackerEl.textContent = displayTracker;
                 }
             } catch (e) {}
         }, 300);

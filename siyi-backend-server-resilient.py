@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-SIYI A8 Mini 网页版后端服务 - 智能融合版 (按需跟踪逻辑)
-核心逻辑：
-1. 引入 idle(待机) 状态：启动或重置后处于待机，不进行任何自动跟踪。
-2. 框选智能识别：框选瞬间判断是人脸还是物体，分别切入 face/object 模式。
-3. 丢失即停止：物体跟踪丢失或漂移时，自动切回 idle 状态，防止云台乱转。
+SIYI A8 Mini 网页版后端服务 - 智能融合版 (MOSSE+CSRT 双引擎融合跟踪)
+核心突破：
+1. 摒弃单一算法的极限压榨，采用“双引擎融合架构”。
+2. MOSSE 每帧实时运行，保证画面绝对丝滑、零延迟。
+3. CSRT 每 5 帧周期校准，提供高精度锚点，并重置 MOSSE 消除累积漂移。
+4. 完美折中：既有 MOSSE 的快，又有 CSRT 的稳。
 """
 
 import asyncio
@@ -35,41 +36,381 @@ UDP_PORT = int(os.environ.get('UDP_PORT', "37260"))
 SERVER_PORT = int(os.environ.get('SERVER_PORT', "8080"))
 WORKSPACE_DIR = os.environ.get('WORKSPACE_DIR', os.path.dirname(os.path.abspath(__file__)))
 
+DEFAULT_DETECTOR = os.environ.get('DETECTOR_TYPE', 'haar') 
+DEFAULT_TRACKER = os.environ.get('TRACKER_TYPE', 'hybrid') 
+
 VIDEO_W = 640
 VIDEO_H = 480
 
-# ── PID 全局控制参数 ──────────────────────────
+# ── PID 全局控制参数 ──
 KP_YAW, KI_YAW, KD_YAW = 0.25, 0.001, 0.04
 KP_PITCH, KI_PITCH, KD_PITCH = 0.18, 0.0008, 0.025
 
 MAX_SPEED = 100
 DEADZONE_IN = 5
 DEADZONE_OUT = 12
-
 ALPHA_ERR = 0.4
 OUT_AVG_WIN = 3
 CONTROL_DT = 0.025
-
 LOST_DECAY_RATE = 0.95
 RECOVERY_FRAMES = 10
 MANUAL_INTERVENTION_THRESHOLD = 150
-
-MIN_FRAME_INTERVAL = 0.04  # 25 FPS 推流限流
+MIN_FRAME_INTERVAL = 0.04  # 25 FPS
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('siyi-merged')
 
-def create_tracker():
-    try: return cv2.legacy.TrackerMOSSE_create()
-    except AttributeError: pass
-    try: return cv2.TrackerMOSSE_create()
-    except AttributeError: pass
-    try: return cv2.legacy.TrackerKCF_create()
-    except AttributeError: pass
-    try: return cv2.TrackerKCF_create()
-    except AttributeError: pass
-    raise RuntimeError("❌ 未找到可用的 OpenCV 跟踪器")
+# ==================== 统一人脸检测器封装 ====================
+class FaceDetector:
+    def __init__(self, method='haar'):
+        self.method = method
+        self.detector = None
+        self.dnn_net = None
+        self.yunet = None
+        self.active_method = 'none'
+        self._load(method)
+        
+    def _find_file(self, filename):
+        paths = [
+            os.path.join(WORKSPACE_DIR, filename),
+            os.path.join(os.path.expanduser('~'), '.opencv', filename),
+            f'/usr/share/opencv4/haarcascades/{filename}' if 'cascade' in filename else filename,
+            f'/usr/local/share/opencv4/haarcascades/{filename}' if 'cascade' in filename else filename,
+        ]
+        for p in paths:
+            if os.path.exists(p): return p
+        return None
 
+    def _load(self, method):
+        self.method = method
+        if method == 'haar':
+            path = self._find_file('haarcascade_frontalface_default.xml')
+            if path: 
+                self.detector = cv2.CascadeClassifier(path)
+                self.active_method = 'haar'
+                logger.info(f"✅ 加载 Haar 人脸检测器成功")
+            else: logger.error("❌ 未找到 Haar 模型文件")
+        elif method == 'lbp':
+            path = self._find_file('lbpcascade_frontalface.xml')
+            if path: 
+                self.detector = cv2.CascadeClassifier(path)
+                self.active_method = 'lbp'
+                logger.info(f"✅ 加载 LBP 人脸检测器成功")
+            else:
+                logger.warning("⚠️ 未找到 LBP 模型文件，自动降级为 Haar")
+                self._load('haar')
+        elif method == 'dnn':
+            try:
+                path = self._find_file('face_detection_yunet_2023mar.onnx')
+                if path:
+                    self.yunet = cv2.FaceDetectorYN.create(path, "", (VIDEO_W, VIDEO_H), 0.9, 0.3, 5000)
+                    self.active_method = 'dnn_yunet'
+                    logger.info(f"✅ 加载 DNN (YuNet) 人脸检测器成功 (高精度)")
+                    return
+            except AttributeError: pass
+            prototxt = self._find_file('deploy.prototxt')
+            model = self._find_file('res10_300x300_ssd_iter_140000.caffemodel')
+            if prototxt and model:
+                self.dnn_net = cv2.dnn.readNetFromCaffe(prototxt, model)
+                self.active_method = 'dnn_ssd'
+                logger.info(f"✅ 加载 DNN (SSD) 人脸检测器成功 (高精度)")
+                return
+            logger.warning("⚠️ 未找到 DNN 模型文件，自动降级为 Haar。")
+            self._load('haar')
+
+    def detect(self, frame):
+        if self.active_method in ['haar', 'lbp'] and self.detector is not None:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = self.detector.detectMultiScale(gray, 1.15, 5, minSize=(40, 40))
+            return faces if len(faces) > 0 else []
+        elif self.active_method == 'dnn_yunet' and self.yunet is not None:
+            h, w = frame.shape[:2]
+            self.yunet.setInputSize((w, h))
+            _, faces = self.yunet.detect(frame)
+            if faces is None: return []
+            return [(int(f[0]), int(f[1]), int(f[2]), int(f[3])) for f in faces]
+        elif self.active_method == 'dnn_ssd' and self.dnn_net is not None:
+            h, w = frame.shape[:2]
+            blob = cv2.dnn.blobFromImage(cv2.resize(frame, (300, 300)), 1.0, (300, 300), (104.0, 177.0, 123.0))
+            self.dnn_net.setInput(blob)
+            detections = self.dnn_net.forward()
+            faces = []
+            for i in range(detections.shape[2]):
+                confidence = detections[0, 0, i, 2]
+                if confidence > 0.5:
+                    box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
+                    (x, y, x1, y1) = box.astype("int")
+                    faces.append((int(x), int(y), int(x1-x), int(y1-y)))
+            return faces
+        return []
+
+# ==================== 统一物体跟踪器封装 (双引擎融合版) ====================
+# ==================== 统一物体跟踪器封装 (修复 SSD 版) ====================
+class ObjectTracker:
+    def __init__(self, method='hybrid'):
+        self.method = method
+        self.tracker = None
+        self.dnn_net = None
+        self.active_method = 'none'
+        
+        self.fast_tracker = None      
+        self.accurate_tracker = None  
+        self.calibrate_interval = 5   
+        self.frame_count = 0
+        self.last_fast_bbox = None
+        self.last_accurate_bbox = None
+        
+        # 新增：保存 SSD 的 Blob 参数
+        self.ssd_blob_params = None 
+        
+        self._load(method)
+
+    def _find_file(self, filename):
+        paths = [
+            os.path.join(WORKSPACE_DIR, filename),
+            os.path.join(os.path.expanduser('~'), '.opencv', filename),
+        ]
+        for p in paths:
+            if os.path.exists(p): return p
+        return None
+
+    def _create_legacy_tracker(self, name):
+        try: return getattr(cv2.legacy, f'Tracker{name}_create')()
+        except AttributeError: pass
+        try: return getattr(cv2, f'Tracker{name}_create')()
+        except AttributeError: pass
+        return None
+
+    # 新增：计算两个框的 IoU (交并比)，用于 SSD 跟踪匹配
+    def _calculate_iou(self, boxA, boxB):
+        xA = max(boxA[0], boxB[0])
+        yA = max(boxA[1], boxB[1])
+        xB = min(boxA[0] + boxA[2], boxB[0] + boxB[2])
+        yB = min(boxA[1] + boxA[3], boxB[1] + boxB[3])
+        interArea = max(0, xB - xA) * max(0, yB - yA)
+        boxAArea = boxA[2] * boxA[3]
+        boxBArea = boxB[2] * boxB[3]
+        iou = interArea / float(boxAArea + boxBArea - interArea + 1e-5)
+        return iou
+
+    def _load(self, method):
+        self.method = method
+        self.frame_count = 0
+        self.last_fast_bbox = None
+        self.last_accurate_bbox = None
+        self.ssd_blob_params = None
+        
+        if method == 'hybrid':
+            self.fast_tracker = self._create_legacy_tracker('MOSSE')
+            self.accurate_tracker = self._create_legacy_tracker('CSRT')
+            if self.fast_tracker and self.accurate_tracker:
+                self.active_method = 'hybrid'
+                logger.info(f"✅ 加载 Hybrid 融合跟踪器")
+            else:
+                self._fallback_tracker('Hybrid')
+        elif method == 'mosse':
+            self.tracker = self._create_legacy_tracker('MOSSE')
+            if self.tracker:
+                self.active_method = 'mosse'
+                logger.info("✅ 加载 MOSSE")
+            else: self._fallback_tracker('MOSSE')
+        elif method == 'kcf':
+            self.tracker = self._create_legacy_tracker('KCF')
+            if self.tracker:
+                self.active_method = 'kcf'
+                logger.info("✅ 加载 KCF")
+            else: self._fallback_tracker('KCF')
+        elif method == 'csrt':
+            self.tracker = self._create_legacy_tracker('CSRT')
+            if self.tracker:
+                self.active_method = 'csrt'
+                logger.info("✅ 加载 CSRT")
+            else: self._fallback_tracker('CSRT')
+        elif method == 'dasiamrpn':
+            # (保持您之前修复好的 DaSiamRPN 代码不变)
+            model = self._find_file('dasiamrpn_model.onnx')
+            kernel_cls1 = self._find_file('dasiamrpn_kernel_cls1.onnx')
+            kernel_r1 = self._find_file('dasiamrpn_kernel_r1.onnx')
+            missing_files = []
+            if not model: missing_files.append('dasiamrpn_model.onnx')
+            if not kernel_cls1: missing_files.append('dasiamrpn_kernel_cls1.onnx')
+            if not kernel_r1: missing_files.append('dasiamrpn_kernel_r1.onnx')
+            if not missing_files:
+                tracker_created = False
+                try:
+                    params = cv2.TrackerDaSiamRPN_Params()
+                    params.model = model; params.kernel_cls1 = kernel_cls1; params.kernel_r1 = kernel_r1
+                    self.tracker = cv2.TrackerDaSiamRPN_create(params)
+                    self.active_method = 'dasiamrpn'; tracker_created = True
+                    logger.info("✅ 加载 DaSiamRPN 成功 (Params API)")
+                except Exception as e1:
+                    try:
+                        net = cv2.dnn.readNet(model)
+                        self.tracker = cv2.TrackerDaSiamRPN_create(net)
+                        self.active_method = 'dasiamrpn'; tracker_created = True
+                        logger.info("✅ 加载 DaSiamRPN 成功 (Net API)")
+                    except Exception as e2:
+                        logger.error(f"❌ DaSiamRPN 失败: {e1} | {e2}")
+                        self._fallback_tracker('DaSiamRPN')
+            else:
+                logger.warning(f"⚠️ 缺失 DaSiamRPN 模型: {missing_files}")
+                self._load('hybrid')
+                
+        elif method == 'ssd':
+            prototxt = self._find_file('deploy.prototxt')
+            model = self._find_file('res10_300x300_ssd_iter_140000.caffemodel')
+            if not prototxt or not model:
+                prototxt = self._find_file('ssd_mobilenet_v1_coco.pbtxt')
+                model = self._find_file('frozen_inference_graph.pb')
+                
+            if prototxt and model:
+                try:
+                    if 'pbtxt' in prototxt:
+                        self.dnn_net = cv2.dnn.readNetFromTensorflow(model, prototxt)
+                        # 核心修复：COCO 通用物体模型的 Blob 参数
+                        self.ssd_blob_params = {'scale': 0.007843, 'mean': (127.5, 127.5, 127.5)}
+                        logger.info("✅ 加载 SSD (通用物体检测 COCO)，支持跟踪 80 类常见物体。")
+                    else:
+                        self.dnn_net = cv2.dnn.readNetFromCaffe(prototxt, model)
+                        # 核心修复：人脸检测模型的 Blob 参数 (之前这里用错了，导致什么都检测不到！)
+                        self.ssd_blob_params = {'scale': 1.0, 'mean': (104.0, 177.0, 123.0)}
+                        logger.warning("⚠️ 当前 SSD 模型为【人脸检测模型】，仅支持跟踪人脸！如需跟踪通用物体，请更换 COCO 模型。")
+                    self.active_method = 'ssd'
+                except Exception as e:
+                    logger.error(f"SSD 初始化失败: {e}")
+                    self._fallback_tracker('SSD')
+            else:
+                logger.warning("⚠️ 未找到 SSD 模型文件，自动降级为 Hybrid")
+                self._load('hybrid')
+
+    def _fallback_tracker(self, failed_name):
+        logger.warning(f"⚠️ {failed_name} 加载失败，尝试降级...")
+        for fallback in ['hybrid', 'csrt', 'kcf', 'mosse']:
+            if fallback == 'hybrid':
+                self.fast_tracker = self._create_legacy_tracker('MOSSE')
+                self.accurate_tracker = self._create_legacy_tracker('CSRT')
+                if self.fast_tracker and self.accurate_tracker:
+                    self.active_method = 'hybrid'
+                    logger.info(f"✅ 降级成功，使用 Hybrid")
+                    return
+            else:
+                self.tracker = self._create_legacy_tracker(fallback.upper())
+                if self.tracker:
+                    self.active_method = fallback
+                    logger.info(f"✅ 降级成功，使用 {fallback.upper()}")
+                    return
+        logger.error("❌ 严重错误：没有任何可用的物体跟踪器！")
+        self.active_method = 'none'
+
+    def init(self, frame, bbox):
+        if self.active_method == 'ssd':
+            self.last_fast_bbox = bbox
+            return True
+        elif self.active_method == 'hybrid':
+            try:
+                self.fast_tracker.init(frame, bbox)
+                self.accurate_tracker.init(frame, bbox)
+                self.last_fast_bbox = bbox
+                self.last_accurate_bbox = bbox
+                self.frame_count = 0
+                return True
+            except Exception as e:
+                logger.error(f"Hybrid init 失败: {e}")
+                return False
+        elif self.tracker:
+            try:
+                self.tracker.init(frame, bbox)
+                self.last_fast_bbox = bbox
+                return True
+            except Exception as e:
+                logger.error(f"Tracker init 失败: {e}")
+                return False
+        return False
+
+    def update(self, frame):
+        self.frame_count += 1
+        
+        # 核心修复：SSD 的 IoU 跟踪逻辑
+        if self.active_method == 'ssd' and self.dnn_net:
+            h, w = frame.shape[:2]
+            params = self.ssd_blob_params
+            # 使用正确的 Blob 参数
+            blob = cv2.dnn.blobFromImage(cv2.resize(frame, (300, 300)), params['scale'], (300, 300), params['mean'])
+            self.dnn_net.setInput(blob)
+            detections = self.dnn_net.forward()
+            
+            # 收集所有置信度大于 0.5 的检测框
+            valid_boxes = []
+            for i in range(detections.shape[2]):
+                confidence = detections[0, 0, i, 2]
+                if confidence > 0.5: 
+                    box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
+                    (x, y, x1, y1) = box.astype("int")
+                    valid_boxes.append((int(x), int(y), int(x1-x), int(y1-y)))
+            
+            if not valid_boxes:
+                return False, None
+            
+            # 核心逻辑：使用 IoU 匹配上一帧的框，实现“跟踪”效果
+            if self.last_fast_bbox:
+                best_iou = 0
+                best_box = None
+                for box in valid_boxes:
+                    iou = self._calculate_iou(self.last_fast_bbox, box)
+                    if iou > best_iou:
+                        best_iou = iou
+                        best_box = box
+                # 如果找到了重叠度大于 0.2 的框，就认为跟踪成功
+                if best_box and best_iou > 0.2: 
+                    self.last_fast_bbox = best_box
+                    return True, best_box
+            
+            # 如果没有匹配到（比如目标被遮挡后重新出现），返回置信度最高的框
+            best_conf = 0
+            best_box = None
+            for i in range(detections.shape[2]):
+                confidence = detections[0, 0, i, 2]
+                if confidence > best_conf:
+                    best_conf = confidence
+                    box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
+                    best_box = box.astype("int")
+            if best_box is not None:
+                bbox = (int(best_box[0]), int(best_box[1]), int(best_box[2]-best_box[0]), int(best_box[3]-best_box[1]))
+                self.last_fast_bbox = bbox
+                return True, bbox
+                
+            return False, None
+
+        # Hybrid 逻辑 (保持不变)
+        if self.active_method == 'hybrid':
+            success_fast, bbox_fast = self.fast_tracker.update(frame)
+            if success_fast: self.last_fast_bbox = bbox_fast
+            if self.frame_count % self.calibrate_interval == 0:
+                success_acc, bbox_acc = self.accurate_tracker.update(frame)
+                if success_acc and bbox_acc:
+                    self.last_accurate_bbox = bbox_acc
+                    try: self.fast_tracker.init(frame, bbox_acc)
+                    except: pass
+            if self.last_accurate_bbox and self.frame_count % self.calibrate_interval == 0:
+                return True, self.last_accurate_bbox
+            elif self.last_fast_bbox:
+                return True, self.last_fast_bbox
+            else:
+                return False, None
+
+        # 其他传统跟踪器 (保持不变)
+        elif self.tracker:
+            try:
+                success, bbox = self.tracker.update(frame)
+                if success: self.last_fast_bbox = bbox
+                else: self.last_fast_bbox = None
+                return success, bbox
+            except Exception as e:
+                logger.error(f"Tracker update 失败: {e}")
+                self.last_fast_bbox = None
+                return False, None
+                
+        return False, None# ==================== 经典智能 PID 控制器 ====================
 class PIDController:
     def __init__(self, kp, ki, kd, max_spd=100):
         self.kp = kp; self.ki = ki; self.kd = kd; self.max_spd = max_spd
@@ -81,19 +422,16 @@ class PIDController:
     def update(self, raw_err, has_target=True):
         now = time.time(); dt = now - self.last_t; self.last_t = now
         if dt <= 0: dt = CONTROL_DT
-        
         if not has_target:
             self.lost_frames += 1
             self.integral *= LOST_DECAY_RATE
             self.filt_err *= LOST_DECAY_RATE
             self.recovery_counter = 0
             return 0
-        
         if self.lost_frames > 5 and abs(raw_err) > MANUAL_INTERVENTION_THRESHOLD:
             self.is_manual_intervention = True
             self.recovery_counter = RECOVERY_FRAMES
             self.integral = 0; self.filt_err = 0; self.prev_err = 0
-        
         self.lost_frames = 0
         if self.recovery_counter > 0:
             self.recovery_counter -= 1
@@ -101,10 +439,8 @@ class PIDController:
         else:
             recovery_factor = 1.0
             self.is_manual_intervention = False
-        
         self.filt_err = ALPHA_ERR * raw_err + (1 - ALPHA_ERR) * self.filt_err
         err = self.filt_err * recovery_factor
-        
         p = self.kp * err
         self.integral += err * dt
         max_i = self.max_spd / (self.ki + 1e-9) if self.ki > 0 else 0
@@ -112,7 +448,6 @@ class PIDController:
         i = self.ki * self.integral
         d = self.kd * (err - self.prev_err) / dt if dt > 0 else 0
         self.prev_err = err
-        
         out = p + i + d
         out = max(-self.max_spd, min(self.max_spd, out))
         self.out_buf.append(out)
@@ -131,21 +466,10 @@ class HybridControlState:
         self.manual_pitch = 0
         self.last_sent_cmd = (0, 0)
         self.lock = threading.Lock()
-        # 核心修改：初始状态为 idle (待机)
         self.tracking_mode = 'idle' 
         self.roi_request = None
 
 g_state = HybridControlState()
-
-def find_haarcascade():
-    paths = [
-        'haarcascade_frontalface_default.xml',
-        '/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml',
-        '/usr/local/share/opencv4/haarcascades/haarcascade_frontalface_default.xml',
-    ]
-    for p in paths:
-        if os.path.exists(p): return p
-    return None
 
 CRC16_TABLE = [
     0x0000,0x1021,0x2042,0x3063,0x4084,0x50A5,0x60C6,0x70E7,0x8108,0x9129,0xA14A,0xB16B,0xC18C,0xD1AD,0xE1CE,0xF1EF,
@@ -187,6 +511,7 @@ def _execute_send(yaw, pitch):
         logger.error(f"UDP 物理发送失败: {e}")
         return False
 
+# ==================== 智能识别与视频采集核心线程 ====================
 class VideoAndTrackingThread(threading.Thread):
     def __init__(self, rtsp_url):
         super().__init__(daemon=True)
@@ -197,16 +522,13 @@ class VideoAndTrackingThread(threading.Thread):
         self.connected = False
         self.lock = threading.Lock()
         
-        cascade_p = find_haarcascade()
-        self.face_cascade = cv2.CascadeClassifier(cascade_p) if cascade_p else None
-        if self.face_cascade: logger.info(f"✅ 人脸追踪器加载成功")
+        self.face_detector = FaceDetector(method=DEFAULT_DETECTOR)
+        self.object_tracker = ObjectTracker(method=DEFAULT_TRACKER)
             
         self.pid_y = PIDController(KP_YAW, KI_YAW, KD_YAW, MAX_SPEED)
         self.pid_p = PIDController(KP_PITCH, KI_PITCH, KD_PITCH, MAX_SPEED)
         self.last_control_t = time.time()
         
-        self.tracker = None
-        # 核心修改：初始状态为 idle (待机)
         self.tracking_mode = 'idle' 
         self.roi_to_init = None
         self.obj_lost_count = 0
@@ -261,7 +583,6 @@ class VideoAndTrackingThread(threading.Thread):
                             yaw_cmd, pitch_cmd = m_yaw, m_pitch
                             cv2.putText(bgr_img, "MODE: MANUAL CONTROL", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
                         else:
-                            # 处理 ROI 初始化 (框选瞬间的智能判断)
                             if self.roi_to_init is not None:
                                 rx, ry, rw, rh = self.roi_to_init
                                 bbox = (int(rx*VIDEO_W), int(ry*VIDEO_H), int(rw*VIDEO_W), int(rh*VIDEO_H))
@@ -269,47 +590,41 @@ class VideoAndTrackingThread(threading.Thread):
                                 
                                 if bbox[2] > 10 and bbox[3] > 10:
                                     roi_img = bgr_img[bbox[1]:bbox[1]+bbox[3], bbox[0]:bbox[0]+bbox[2]]
-                                    roi_gray = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY)
-                                    faces_in_roi = self.face_cascade.detectMultiScale(roi_gray, 1.1, 3, minSize=(20, 20)) if self.face_cascade else []
+                                    faces_in_roi = self.face_detector.detect(roi_img)
                                     
                                     if len(faces_in_roi) > 0:
                                         self.tracking_mode = 'face'
                                         with g_state.lock: g_state.tracking_mode = 'face'
-                                        self.tracker = None
                                         logger.info(f"👤 框选区域检测到人脸，切入【人脸跟踪模式】")
                                     else:
-                                        try:
-                                            self.tracker = create_tracker()
-                                            self.tracker.init(bgr_img, bbox)
+                                        if self.object_tracker.init(bgr_img, bbox):
                                             self.obj_lost_count = 0
                                             self.smooth_fx = bbox[0] + bbox[2] // 2
                                             self.smooth_fy = bbox[1] + bbox[3] // 2
                                             self.tracking_mode = 'object'
                                             with g_state.lock: g_state.tracking_mode = 'object'
-                                            logger.info(f"🎯 框选区域未检测到人脸，切入【物体跟踪模式】")
-                                        except Exception as e:
-                                            logger.error(f"Tracker 初始化失败: {e}")
+                                            logger.info(f"🎯 切入【物体跟踪模式】 (使用 {self.object_tracker.active_method.upper()})")
+                                        else:
+                                            logger.error("Tracker 初始化失败，切回待机")
                                             self.tracking_mode = 'idle'
                                             with g_state.lock: g_state.tracking_mode = 'idle'
                                 self.roi_to_init = None
                                 self.pid_y.reset(); self.pid_p.reset()
 
-                            # ─── 核心逻辑分支：根据 tracking_mode 执行 ───
                             if self.tracking_mode == 'idle':
-                                # 待机状态：不跟踪，不发送指令，仅显示中心十字
                                 cv2.line(bgr_img, (cx - 20, cy), (cx + 20, cy), (255, 255, 255), 1)
                                 cv2.line(bgr_img, (cx, cy - 20), (cx, cy + 20), (255, 255, 255), 1)
                                 cv2.putText(bgr_img, "MODE: IDLE (SELECT TARGET)", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (128, 128, 128), 2)
                                 yaw_cmd, pitch_cmd = 0, 0
                                 
-                            elif self.tracking_mode == 'object' and self.tracker is not None:
-                                success, bbox = self.tracker.update(bgr_img)
+                            elif self.tracking_mode == 'object':
+                                success, bbox = self.object_tracker.update(bgr_img)
                                 
                                 cv2.line(bgr_img, (cx - 20, cy), (cx + 20, cy), (255, 255, 255), 1)
                                 cv2.line(bgr_img, (cx, cy - 20), (cx, cy + 20), (255, 255, 255), 1)
                                 cv2.rectangle(bgr_img, (cx - DEADZONE_OUT, cy - DEADZONE_IN), (cx + DEADZONE_OUT, cy + DEADZONE_IN), (100, 100, 100), 1)
 
-                                if success:
+                                if success and bbox is not None:
                                     px, py, pw, ph = [int(v) for v in bbox]
                                     fx_raw, fy_raw = px + pw // 2, py + ph // 2
                                     
@@ -321,7 +636,6 @@ class VideoAndTrackingThread(threading.Thread):
                                     
                                     if abs(dx) > VIDEO_W * 0.4 or abs(dy) > VIDEO_H * 0.4:
                                         logger.warning("⚠️ 物体跟踪漂移过大，强制切回待机")
-                                        self.tracker = None
                                         self.tracking_mode = 'idle'
                                         with g_state.lock: g_state.tracking_mode = 'idle'
                                         self.pid_y.reset(); self.pid_p.reset()
@@ -336,60 +650,48 @@ class VideoAndTrackingThread(threading.Thread):
                                             else:
                                                 ratio = (abs(dx) - DEADZONE_IN) / (DEADZONE_OUT - DEADZONE_IN + 1e-5)
                                                 yaw_cmd = int(self.pid_y.update(dx, has_target=True) * ratio)
-                                                
                                             if abs(dy) <= DEADZONE_IN: pitch_cmd = 0
                                             elif abs(dy) > DEADZONE_OUT: pitch_cmd = self.pid_p.update(-dy, has_target=True)
                                             else:
                                                 ratio = (abs(dy) - DEADZONE_IN) / (DEADZONE_OUT - DEADZONE_IN + 1e-5)
                                                 pitch_cmd = int(self.pid_p.update(-dy, has_target=True) * ratio)
-                                            
                                             self.last_control_t = now_t
                                         else:
                                             with g_state.lock: yaw_cmd, pitch_cmd = g_state.last_sent_cmd
-                                            
-                                        cv2.putText(bgr_img, "MODE: OBJECT TRACKING", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 100, 0), 2)
+                                        cv2.putText(bgr_img, f"MODE: OBJECT ({self.object_tracker.active_method.upper()})", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 100, 0), 2)
                                 else:
                                     if now_t - self.last_control_t >= CONTROL_DT:
                                         self.pid_y.update(0, has_target=False)
                                         self.pid_p.update(0, has_target=False)
                                         self.last_control_t = now_t
-                                        
                                     self.obj_lost_count += 1
                                     cv2.putText(bgr_img, f"MODE: OBJECT LOST ({self.obj_lost_count}/15)", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-                                    # 核心修改：物体丢失后切回 idle，不再自动切回人脸
                                     if self.obj_lost_count > 15:
-                                        self.tracker = None
                                         self.tracking_mode = 'idle'
                                         with g_state.lock: g_state.tracking_mode = 'idle'
                                         self.pid_y.reset(); self.pid_p.reset()
                                         
                             elif self.tracking_mode == 'face':
-                                if self.face_cascade and frame_counter % 2 == 0:
-                                    gray = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2GRAY)
-                                    faces = self.face_cascade.detectMultiScale(gray, 1.15, 5, minSize=(40, 40))
-                                
+                                if frame_counter % 2 == 0:
+                                    faces = self.face_detector.detect(bgr_img)
                                 has_face = len(faces) > 0
                                 cv2.line(bgr_img, (cx - 20, cy), (cx + 20, cy), (255, 255, 255), 1)
                                 cv2.line(bgr_img, (cx, cy - 20), (cx, cy + 20), (255, 255, 255), 1)
                                 cv2.rectangle(bgr_img, (cx - DEADZONE_OUT, cy - DEADZONE_IN), (cx + DEADZONE_OUT, cy + DEADZONE_IN), (100, 100, 100), 1)
-                                
                                 if has_face:
                                     largest_face = max(faces, key=lambda f: f[2] * f[3])
                                     x, y, ww, hh = largest_face
                                     fx, fy = x + ww // 2, y + hh // 2
                                     dx, dy = fx - cx, fy - cy
-                                    
                                     cv2.rectangle(bgr_img, (x, y), (x + ww, y + hh), (0, 255, 0), 2)
                                     cv2.circle(bgr_img, (fx, fy), 4, (0, 0, 255), -1)
                                     cv2.line(bgr_img, (cx, cy), (fx, fy), (255, 0, 0), 1)
-                                    
                                     if now_t - self.last_control_t >= CONTROL_DT:
                                         if abs(dx) <= DEADZONE_IN: yaw_cmd = 0
                                         elif abs(dx) > DEADZONE_OUT: yaw_cmd = self.pid_y.update(dx, has_target=True)
                                         else:
                                             ratio = (abs(dx) - DEADZONE_IN) / (DEADZONE_OUT - DEADZONE_IN + 1e-5)
                                             yaw_cmd = int(self.pid_y.update(dx, has_target=True) * ratio)
-                                            
                                         if abs(dy) <= DEADZONE_IN: pitch_cmd = 0
                                         elif abs(dy) > DEADZONE_OUT: pitch_cmd = self.pid_p.update(-dy, has_target=True)
                                         else:
@@ -398,7 +700,7 @@ class VideoAndTrackingThread(threading.Thread):
                                         self.last_control_t = now_t
                                     else:
                                         with g_state.lock: yaw_cmd, pitch_cmd = g_state.last_sent_cmd
-                                    cv2.putText(bgr_img, "MODE: FACE TRACKING", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                                    cv2.putText(bgr_img, f"MODE: FACE ({self.face_detector.active_method.upper()})", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                                 else:
                                     if now_t - self.last_control_t >= CONTROL_DT:
                                         self.pid_y.update(0, has_target=False)
@@ -412,7 +714,7 @@ class VideoAndTrackingThread(threading.Thread):
                             else:
                                 _execute_send(yaw_cmd, pitch_cmd)
 
-                        _, buf = cv2.imencode('.jpg', bgr_img, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
+                        _, buf = cv2.imencode('.jpg', bgr_img, [int(cv2.IMWRITE_JPEG_QUALITY), 45])
                         with self.lock:
                             self.last_frame = buf.tobytes()
                             self.last_frame_time = time.time()
@@ -435,6 +737,7 @@ class VideoAndTrackingThread(threading.Thread):
 video_thread = VideoAndTrackingThread(RTSP_URL)
 video_thread.start()
 
+# ==================== 后端路由与 API ====================
 async def gimbal_watchdog_ctx(app):
     logger.info("🕵️ 智能混合看门狗就绪")
     async def watchdog_loop():
@@ -483,20 +786,42 @@ async def handle_tracker_init(request):
         return web.json_response({'status': 'error', 'reason': str(e)}, status=500)
 
 async def handle_tracker_reset(request):
-    # 核心修改：重置时切回 idle 状态
     with g_state.lock:
         g_state.tracking_mode = 'idle'
         g_state.roi_request = None
     video_thread.tracking_mode = 'idle'
-    video_thread.tracker = None
     video_thread.roi_to_init = None
     return web.json_response({'status': 'success'})
+
+async def handle_detector_switch(request):
+    try:
+        data = await request.json()
+        method = data.get('method', 'haar')
+        if method not in ['haar', 'lbp', 'dnn']:
+            return web.json_response({'status': 'error', 'reason': 'Invalid method.'}, status=400)
+        video_thread.face_detector._load(method)
+        return web.json_response({'status': 'success', 'active_method': video_thread.face_detector.active_method})
+    except Exception as e:
+        return web.json_response({'status': 'error', 'reason': str(e)}, status=500)
+
+async def handle_tracker_switch(request):
+    try:
+        data = await request.json()
+        method = data.get('method', 'hybrid')
+        if method not in ['hybrid', 'mosse', 'kcf', 'csrt', 'dasiamrpn', 'ssd']:
+            return web.json_response({'status': 'error', 'reason': 'Invalid method.'}, status=400)
+        video_thread.object_tracker._load(method)
+        return web.json_response({'status': 'success', 'active_method': video_thread.object_tracker.active_method})
+    except Exception as e:
+        return web.json_response({'status': 'error', 'reason': str(e)}, status=500)
 
 async def handle_status(request):
     return web.json_response({
         'rtsp_connected': video_thread.connected, 
         'system_mode': 'manual' if g_state.manual_mode else 'auto',
-        'tracking_mode': g_state.tracking_mode
+        'tracking_mode': g_state.tracking_mode,
+        'detector_type': video_thread.face_detector.active_method,
+        'tracker_type': video_thread.object_tracker.active_method
     })
 
 async def handle_static(request):
@@ -513,7 +838,6 @@ async def websocket_handler(request):
         while not ws.closed:
             current_frame = video_thread.get_latest_frame()
             current_frame_time = video_thread.last_frame_time
-            
             if current_frame and current_frame_time > last_sent_frame_time:
                 now = time.time()
                 if now - last_sent_frame_time >= MIN_FRAME_INTERVAL:
@@ -534,6 +858,8 @@ async def init_app():
     app.router.add_post('/api/gimbal/control', handle_gimbal_control)
     app.router.add_post('/api/tracker/init', handle_tracker_init)
     app.router.add_post('/api/tracker/reset', handle_tracker_reset)
+    app.router.add_post('/api/detector/switch', handle_detector_switch)
+    app.router.add_post('/api/tracker/switch', handle_tracker_switch)
     app.router.add_get('/api/status', handle_status)
     app.router.add_get('/{path:.*}', handle_static)
     app.cleanup_ctx.append(gimbal_watchdog_ctx)
