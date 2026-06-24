@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-SIYI A8 Mini 人脸跟踪 + 键盘控制融合版 - 位置开环跟踪模式
-- 使用 setGimbalAttitude 命令直接设定目标角度
+SIYI A8 Mini 人脸跟踪 + 键盘控制融合版
 - 默认自动人脸跟踪
-- WSAD 手动控制云台（增量式角度控制）
+- WSAD 手动控制云台
 - 空格回中
 - 松开按键自动恢复跟踪
 
@@ -67,34 +66,109 @@ UDP_PORT = 37260
 VIDEO_W = 640
 VIDEO_H = 480
 
-# ── 位置控制参数 ──────────────────────────
-# 角度增量（单位：0.1度，即 10 = 1.0度）
-ANGLE_STEP = 30  # 每次跟踪误差产生的角度增量（3.0度）
+# ── PID 参数 ──────────────────────────
+KP_YAW = 0.25
+KI_YAW = 0.001
+KD_YAW = 0.04
 
-# 最大/最小角度限制（单位：0.1度）
-MAX_YAW_ANGLE = 3600   # 360.0度
-MIN_YAW_ANGLE = -3600  # -360.0度
-MAX_PITCH_ANGLE = 900  # 90.0度
-MIN_PITCH_ANGLE = -900 # -90.0度
+KP_PITCH = 0.18
+KI_PITCH = 0.0008
+KD_PITCH = 0.025
 
-# 死区（像素）
-DEADZONE_X = 30
-DEADZONE_Y = 30
+MAX_SPEED = 100
+DEADZONE_IN = 5
+DEADZONE_OUT = 12
+ALPHA_ERR = 0.3
+OUT_AVG_WIN = 3
+CONTROL_DT = 0.025
 
-# 控制周期（秒）
-CONTROL_DT = 0.1
+# ── 手拉跟随参数 ──────────────────────
+LOST_DECAY_RATE = 0.95
+RECOVERY_FRAMES = 10
+MANUAL_INTERVENTION_THRESHOLD = 150
 
-# ── 键盘控制参数 ──────────────────────────
-MANUAL_ANGLE_STEP = 50  # 手动控制每次步进5.0度
-BOOST_ANGLE_STEP = 120  # 加速步进12.0度
+# ── 键盘控制参数 ──────────────────────
+MANUAL_SPEED = 50
+BOOST_SPEED = 100
 HOME_STEPS = 20
-HOME_DELAY = 0.05
+HOME_DELAY = 0.1
 
 # ==================== 全局变量 ====================
 manual_mode = False
-current_yaw_angle = 0    # 当前目标偏航角（0.1度）
-current_pitch_angle = 0  # 当前目标俯仰角（0.1度）
+manual_yaw = 0
+manual_pitch = 0
 lock = threading.Lock()
+
+# ==================== PID 控制器 ====================
+class PIDController:
+    def __init__(self, kp, ki, kd, max_spd=100):
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+        self.max_spd = max_spd
+        self.integral = 0.0
+        self.prev_err = 0.0
+        self.filt_err = 0.0
+        self.last_t = time.time()
+        self.out_buf = deque(maxlen=OUT_AVG_WIN)
+        self.lost_frames = 0
+        self.recovery_counter = 0
+        self.is_manual_intervention = False
+
+    def update(self, raw_err, has_face=True):
+        now = time.time()
+        dt = now - self.last_t
+        self.last_t = now
+        if dt <= 0:
+            dt = CONTROL_DT
+
+        if not has_face:
+            self.lost_frames += 1
+            self.integral *= LOST_DECAY_RATE
+            self.filt_err *= LOST_DECAY_RATE
+            self.recovery_counter = 0
+            return 0
+
+        if self.lost_frames > 5 and abs(raw_err) > MANUAL_INTERVENTION_THRESHOLD:
+            self.is_manual_intervention = True
+            self.recovery_counter = RECOVERY_FRAMES
+            self.integral = 0
+            self.filt_err = 0
+            self.prev_err = 0
+
+        self.lost_frames = 0
+
+        if self.recovery_counter > 0:
+            self.recovery_counter -= 1
+            recovery_factor = 1.0 - (self.recovery_counter / RECOVERY_FRAMES)
+        else:
+            recovery_factor = 1.0
+            self.is_manual_intervention = False
+
+        self.filt_err = ALPHA_ERR * raw_err + (1 - ALPHA_ERR) * self.filt_err
+        err = self.filt_err * recovery_factor
+
+        p = self.kp * err
+        self.integral += err * dt
+        max_i = self.max_spd / (self.ki + 1e-9) if self.ki > 0 else 0
+        self.integral = max(-max_i, min(max_i, self.integral))
+        i = self.ki * self.integral
+        d = self.kd * (err - self.prev_err) / dt if dt > 0 else 0
+        self.prev_err = err
+
+        out = p + i + d
+        out = max(-self.max_spd, min(self.max_spd, out))
+        self.out_buf.append(out)
+        return int(np.mean(self.out_buf))
+
+    def reset(self):
+        self.integral = 0.0
+        self.prev_err = 0.0
+        self.filt_err = 0.0
+        self.out_buf.clear()
+        self.lost_frames = 0
+        self.recovery_counter = 0
+        self.is_manual_intervention = False
 
 # ==================== 工具函数 ====================
 def find_haarcascade():
@@ -128,19 +202,24 @@ def crc16(d):
         crc = ((crc << 8) ^ CRC16_TABLE[tmp]) & 0xFFFF
     return crc
 
+def send_gimbal(yaw, pitch):
+    yaw = max(-100, min(100, int(yaw)))
+    pitch = max(-100, min(100, int(pitch)))
+    
+    pkt = struct.pack('<H B H H B b b', 0x6655, 0x00, 0x0002, 0x0001, 0x07, yaw, pitch)
+    pkt += struct.pack('<H', crc16(pkt))
+    
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.sendto(pkt, (CAMERA_IP, UDP_PORT))
+        s.close()
+    except Exception as e:
+        print(f"[ERR] 发送失败：{e}")
+
 def send_gimbal_angle(yaw_angle, pitch_angle):
-    """
-    发送角度命令到云台（位置开环控制）
-    使用 SET_GIMBAL_ATTITUDE 命令 (0x01)
+    yaw_angle = max(-36000, min(36000, int(yaw_angle)))
+    pitch_angle = max(-36000, min(36000, int(pitch_angle)))
     
-    参数：
-    - yaw_angle: 偏航角（0.1度为单位，例如 450 = 45.0度）
-    - pitch_angle: 俯仰角（0.1度为单位，例如 -300 = -30.0度）
-    """
-    yaw_angle = max(MIN_YAW_ANGLE, min(MAX_YAW_ANGLE, int(yaw_angle)))
-    pitch_angle = max(MIN_PITCH_ANGLE, min(MAX_PITCH_ANGLE, int(pitch_angle)))
-    
-    # 协议格式：STX(0x6655) + CTRL(0x00) + DataLen(0x0002) + SEQ(0x0001) + CMD_ID(0x01) + Yaw(int16) + Pitch(int16) + CRC16
     pkt = struct.pack('<H B H H B h h', 0x6655, 0x00, 0x0002, 0x0001, 0x01, yaw_angle, pitch_angle)
     pkt += struct.pack('<H', crc16(pkt))
     
@@ -149,38 +228,36 @@ def send_gimbal_angle(yaw_angle, pitch_angle):
         s.sendto(pkt, (CAMERA_IP, UDP_PORT))
         s.close()
     except Exception as e:
-        print(f"[ERR] 发送角度命令失败：{e}")
+        print(f"[ERR] 发送角度失败：{e}")
 
 def initialize_gimbal():
-    """初始化云台，回到中心位置"""
-    global current_yaw_angle, current_pitch_angle
-    
     print("[INIT] 正在初始化云台...")
+    for _ in range(5):
+        send_gimbal(0, 0)
+        time.sleep(0.05)
     
-    # 逐步回到中心
     for step in range(HOME_STEPS):
-        factor = 1.0 - (step / HOME_STEPS)
-        yaw = int(current_yaw_angle * factor)
-        pitch = int(current_pitch_angle * factor)
-        send_gimbal_angle(yaw, pitch)
+        speed_factor = 1.0 - (step / HOME_STEPS)
+        current_speed = int(40 * speed_factor)
+        send_gimbal(current_speed, current_speed)
         time.sleep(HOME_DELAY)
     
-    # 最终归零
-    send_gimbal_angle(0, 0)
-    time.sleep(0.5)
-    send_gimbal_angle(0, 0)
+    for _ in range(5):
+        send_gimbal(0, 0)
+        time.sleep(0.05)
     
-    current_yaw_angle = 0
-    current_pitch_angle = 0
+    for _ in range(3):
+        send_gimbal_angle(0, 0)
+        time.sleep(0.1)
     
     print("[INIT] 云台初始化完成")
 
 # ==================== 键盘监听线程 ====================
 def keyboard_listener():
-    global manual_mode, current_yaw_angle, current_pitch_angle
+    global manual_mode, manual_yaw, manual_pitch
     
     print("[KEY] 键盘控制已启动")
-    print("  WSAD - 手动控制云台角度")
+    print("  WSAD - 手动控制")
     print("  Shift+WSAD - 快速移动")
     print("  空格 - 回中")
     print("  T - 切换跟踪/手动模式")
@@ -190,59 +267,50 @@ def keyboard_listener():
     while True:
         try:
             with lock:
-                yaw_delta = 0
-                pitch_delta = 0
+                yaw = 0
+                pitch = 0
                 boost = keyboard.is_pressed("shift")
-                step = BOOST_ANGLE_STEP if boost else MANUAL_ANGLE_STEP
+                speed = BOOST_SPEED if boost else MANUAL_SPEED
 
                 if keyboard.is_pressed("w"):
-                    pitch_delta = step
+                    pitch = speed
                 elif keyboard.is_pressed("s"):
-                    pitch_delta = -step
+                    pitch = -speed
 
                 if keyboard.is_pressed("a"):
-                    yaw_delta = -step
+                    yaw = -speed
                 elif keyboard.is_pressed("d"):
-                    yaw_delta = step
+                    yaw = speed
 
                 if keyboard.is_pressed("space"):
                     print("[CMD] 回中")
-                    # 逐步回到中心
-                    for i in range(HOME_STEPS):
-                        factor = 1.0 - (i / HOME_STEPS)
-                        yaw = int(current_yaw_angle * factor)
-                        pitch = int(current_pitch_angle * factor)
-                        send_gimbal_angle(yaw, pitch)
-                        time.sleep(HOME_DELAY)
-                    
-                    send_gimbal_angle(0, 0)
-                    current_yaw_angle = 0
-                    current_pitch_angle = 0
-                    manual_mode = False
-                    time.sleep(0.3)
+                    send_gimbal(0, 0)
+                    time.sleep(0.1)
+                    for _ in range(3):
+                        send_gimbal_angle(0, 0)
+                        time.sleep(0.1)
+                    manual_yaw = 0
+                    manual_pitch = 0
+                    time.sleep(0.5)
                     continue
 
-                if yaw_delta != 0 or pitch_delta != 0:
+                if yaw != 0 or pitch != 0:
                     manual_mode = True
-                    current_yaw_angle += yaw_delta
-                    current_pitch_angle += pitch_delta
-                    
-                    # 限制角度范围
-                    current_yaw_angle = max(MIN_YAW_ANGLE, min(MAX_YAW_ANGLE, current_yaw_angle))
-                    current_pitch_angle = max(MIN_PITCH_ANGLE, min(MAX_PITCH_ANGLE, current_pitch_angle))
-                    
-                    send_gimbal_angle(current_yaw_angle, current_pitch_angle)
+                    manual_yaw = yaw
+                    manual_pitch = pitch
                     
                     direction = []
-                    if pitch_delta > 0: direction.append("上")
-                    if pitch_delta < 0: direction.append("下")
-                    if yaw_delta < 0: direction.append("左")
-                    if yaw_delta > 0: direction.append("右")
-                    print(f"[MANUAL] {' '.join(direction)} (yaw={current_yaw_angle/10:.1f}°, pitch={current_pitch_angle/10:.1f}°)")
+                    if pitch > 0: direction.append("上")
+                    if pitch < 0: direction.append("下")
+                    if yaw < 0: direction.append("左")
+                    if yaw > 0: direction.append("右")
+                    print(f"[MANUAL] {' '.join(direction)} ({yaw}, {pitch})")
                 else:
                     if manual_mode:
                         manual_mode = False
                         print("[MODE] 恢复自动跟踪")
+                        manual_yaw = 0
+                        manual_pitch = 0
 
                 if keyboard.is_pressed("t"):
                     manual_mode = not manual_mode
@@ -252,7 +320,7 @@ def keyboard_listener():
 
                 if keyboard.is_pressed("h"):
                     print("\n=== 控制帮助 ===")
-                    print("WSAD - 手动控制云台角度")
+                    print("WSAD - 手动控制云台")
                     print("Shift+WSAD - 快速移动")
                     print("空格 - 回中")
                     print("T - 切换跟踪/手动模式")
@@ -262,7 +330,7 @@ def keyboard_listener():
 
                 if keyboard.is_pressed("q"):
                     print("[CMD] 准备退出...")
-                    send_gimbal_angle(0, 0)
+                    send_gimbal(0, 0)
                     os._exit(0)
 
             time.sleep(0.02)
@@ -342,22 +410,24 @@ def detect_face_multi_scale(face_cascade, gray):
 
 # ==================== MAIN ====================
 def main():
-    global manual_mode, current_yaw_angle, current_pitch_angle
+    global manual_mode, manual_yaw, manual_pitch
     
     print("=" * 60)
-    print("  SIYI A8 Mini 人脸跟踪 - 位置开环跟踪模式")
+    print("  SIYI A8 Mini 人脸跟踪 + 键盘控制 v1.0")
     print("=" * 60)
     
     initialize_gimbal()
+    
+    pid_y = PIDController(KP_YAW, KI_YAW, KD_YAW, MAX_SPEED)
+    pid_p = PIDController(KP_PITCH, KI_PITCH, KD_PITCH, MAX_SPEED)
 
     print(f"\n{'=' * 55}")
-    print(f"位置开环跟踪参数:")
-    print(f"  角度步进: {ANGLE_STEP/10:.1f}°")
-    print(f"  死区: {DEADZONE_X}x{DEADZONE_Y} 像素")
-    print(f"  控制周期: {CONTROL_DT}s")
+    print(f"Kp_y={KP_YAW} Ki_y={KI_YAW} Kd_y={KD_YAW}")
+    print(f"Kp_p={KP_PITCH} Ki_p={KI_PITCH} Kd_p={KD_PITCH}")
     print("=" * 55)
     print("自动跟踪模式 - 按 WSAD 切手动，松开恢复跟踪")
-    print("Q 退出 | O 切换多尺度")
+    print("Q 退出 | R 重置 PID | O 切换多尺度")
+    print("[/] 水平Kp | ;/' 垂直Kp")
     print("=" * 55 + "\n")
 
     key_thread = threading.Thread(target=keyboard_listener, daemon=True)
@@ -365,7 +435,7 @@ def main():
 
     cascade_path = find_haarcascade()
     if not cascade_path:
-        print('[ERR] 未找到 Haar Cascade 文件！')
+        print('[ERR] 未找到 Haar  Cascade 文件！')
         print('请安装 opencv-contrib-python 或手动下载 haarcascade_frontalface_default.xml')
         exit(1)
     
@@ -389,6 +459,7 @@ def main():
     
     print('[SUCCESS] RTSP 流连接成功')
     
+    last_sent = (None, None)
     fcnt = 0
     t_ctrl = time.time()
     use_multi_scale = True
@@ -413,24 +484,31 @@ def main():
             else:
                 faces = fc.detectMultiScale(gray, 1.1, 5, minSize=(30, 30))
 
-            # 绘制十字线和死区
             cv2.line(fr, (cx-25, cy), (cx+25, cy), (255, 255, 255), 1)
             cv2.line(fr, (cx, cy-25), (cx, cy+25), (255, 255, 255), 1)
-            cv2.rectangle(fr, (cx-DEADZONE_X, cy-DEADZONE_Y), 
-                         (cx+DEADZONE_X, cy+DEADZONE_Y), (80, 80, 80), 1)
+            cv2.rectangle(fr, (cx-DEADZONE_OUT, cy-DEADZONE_IN), 
+                         (cx+DEADZONE_OUT, cy+DEADZONE_IN), (80, 80, 80), 1)
 
+            yaw_cmd = pitch_cmd = 0
             has_face = len(faces) > 0
 
             with lock:
                 is_manual = manual_mode
 
             if is_manual:
+                with lock:
+                    yaw_cmd = manual_yaw
+                    pitch_cmd = manual_pitch
+
                 cv2.putText(fr, "MANUAL CONTROL", (10, 28),
                            cv2.FONT_HERSHEY_SIMPLEX, .6, (0, 255, 255), 2)
-                cv2.putText(fr, f"yaw={current_yaw_angle/10:.1f}° pit={current_pitch_angle/10:.1f}°",
+                cv2.putText(fr, f"yaw={yaw_cmd:+3d} pit={pitch_cmd:+3d}",
                            (10, 50), cv2.FONT_HERSHEY_SIMPLEX, .42, (0, 255, 255), 1)
 
-            elif has_face and (time.time() - t_ctrl >= CONTROL_DT):
+                if fcnt % 15 == 0:
+                    print(f"[MANUAL] yaw={yaw_cmd:+3d} pit={pitch_cmd:+3d}")
+
+            elif has_face:
                 largest = max(faces, key=lambda f: f[2] * f[3])
                 x, y, ww, hh = largest
                 fx, fy = x + ww // 2, y + hh // 2
@@ -442,58 +520,61 @@ def main():
                 cv2.putText(fr, f"SZ:{ww}x{hh}", (x, y - 8),
                            cv2.FONT_HERSHEY_SIMPLEX, .4, (0, 255, 0), 1)
 
-                # 位置开环跟踪：根据误差计算角度增量
-                yaw_delta = 0
-                pitch_delta = 0
-                
-                if abs(dx) > DEADZONE_X:
-                    yaw_delta = int(np.sign(dx) * ANGLE_STEP)
-                if abs(dy) > DEADZONE_Y:
-                    pitch_delta = int(-np.sign(dy) * ANGLE_STEP)  # 负号是因为图像坐标系和云台方向相反
-                
-                if yaw_delta != 0 or pitch_delta != 0:
-                    current_yaw_angle += yaw_delta
-                    current_pitch_angle += pitch_delta
+                if time.time() - t_ctrl >= CONTROL_DT:
+                    if abs(dx) <= DEADZONE_IN:
+                        yaw_cmd = 0
+                    elif abs(dx) > DEADZONE_OUT:
+                        yaw_cmd = pid_y.update(dx, has_face=True)
+                    else:
+                        ratio = (abs(dx) - DEADZONE_IN) / (DEADZONE_OUT - DEADZONE_IN)
+                        yaw_cmd = pid_y.update(int(np.sign(dx) * abs(dx)), has_face=True)
+                        yaw_cmd = int(yaw_cmd * ratio)
+                    if abs(yaw_cmd) < 3:
+                        yaw_cmd = 0
+
+                    if abs(dy) <= DEADZONE_IN:
+                        pitch_cmd = 0
+                    elif abs(dy) > DEADZONE_OUT:
+                        pitch_cmd = pid_p.update(-dy, has_face=True)
+                    else:
+                        ratio = (abs(dy) - DEADZONE_IN) / (DEADZONE_OUT - DEADZONE_IN)
+                        pitch_cmd = pid_p.update(int(-np.sign(dy) * abs(dy)), has_face=True)
+                        pitch_cmd = int(pitch_cmd * ratio)
+                    if abs(pitch_cmd) < 3:
+                        pitch_cmd = 0
                     
-                    # 限制角度范围
-                    current_yaw_angle = max(MIN_YAW_ANGLE, min(MAX_YAW_ANGLE, current_yaw_angle))
-                    current_pitch_angle = max(MIN_PITCH_ANGLE, min(MAX_PITCH_ANGLE, current_pitch_angle))
-                    
-                    send_gimbal_angle(current_yaw_angle, current_pitch_angle)
-                    
-                    cv2.putText(fr, "TRACKING", (10, 28),
-                               cv2.FONT_HERSHEY_SIMPLEX, .6, (0, 255, 0), 2)
+                    t_ctrl = time.time()
+
+                if pid_y.is_manual_intervention or pid_p.is_manual_intervention:
+                    cv2.putText(fr, "MANUAL FOLLOW", (10, 28),
+                               cv2.FONT_HERSHEY_SIMPLEX, .6, (0, 255, 255), 2)
                 else:
-                    cv2.putText(fr, "CENTERED", (10, 28),
+                    st = "TRACK" if (yaw_cmd or pitch_cmd) else "CENTERED"
+                    cv2.putText(fr, f"{st}", (10, 28),
                                cv2.FONT_HERSHEY_SIMPLEX, .6, (0, 255, 0), 2)
 
                 cv2.putText(fr, f"dx={dx:+3d} dy={dy:+3d}", (10, 50),
                            cv2.FONT_HERSHEY_SIMPLEX, .42, (255, 255, 0), 1)
-                cv2.putText(fr, f"yaw={current_yaw_angle/10:.1f}° pit={current_pitch_angle/10:.1f}°", (10, 68),
+                cv2.putText(fr, f"yaw={yaw_cmd:+3d} pit={pitch_cmd:+3d}", (10, 68),
                            cv2.FONT_HERSHEY_SIMPLEX, .42, (0, 255, 255), 1)
 
                 if fcnt % 15 == 0:
-                    print(f"[TRK] dx={dx:+3d} dy={dy:+3d} | yaw={current_yaw_angle/10:.1f}° pit={current_pitch_angle/10:.1f}°")
-                
-                t_ctrl = time.time()
-            elif has_face:
-                # 显示人脸但不更新角度
-                largest = max(faces, key=lambda f: f[2] * f[3])
-                x, y, ww, hh = largest
-                fx, fy = x + ww // 2, y + hh // 2
-                
-                cv2.rectangle(fr, (x, y), (x + ww, y + hh), (0, 255, 0), 2)
-                cv2.circle(fr, (fx, fy), 4, (0, 0, 255), -1)
-                cv2.putText(fr, f"SZ:{ww}x{hh}", (x, y - 8),
-                           cv2.FONT_HERSHEY_SIMPLEX, .4, (0, 255, 0), 1)
-                cv2.putText(fr, "WAITING", (10, 28),
-                           cv2.FONT_HERSHEY_SIMPLEX, .6, (0, 255, 255), 2)
+                    manual_tag = " [MANUAL]" if (pid_y.is_manual_intervention or pid_p.is_manual_intervention) else ""
+                    print(f"[TRK] dx={dx:+3d} dy={dy:+3d} | yaw={yaw_cmd:+3d} pit={pitch_cmd:+3d}{manual_tag}")
             else:
+                if time.time() - t_ctrl >= CONTROL_DT:
+                    pid_y.update(0, has_face=False)
+                    pid_p.update(0, has_face=False)
+                    t_ctrl = time.time()
                 cv2.putText(fr, "No Face", (10, 28),
                            cv2.FONT_HERSHEY_SIMPLEX, .6, (0, 0, 255), 2)
 
+            if (yaw_cmd, pitch_cmd) != last_sent:
+                send_gimbal(yaw_cmd, pitch_cmd)
+                last_sent = (yaw_cmd, pitch_cmd)
+
             ms = "MS" if use_multi_scale else "SS"
-            cv2.putText(fr, f"Step={ANGLE_STEP/10:.1f}° [{ms}]",
+            cv2.putText(fr, f"Ky={pid_y.kp:.2f} Kpy={pid_p.kp:.2f} [{ms}]",
                        (10, VIDEO_H - 14), cv2.FONT_HERSHEY_SIMPLEX, .38, (180, 180, 180), 1)
 
             cv2.imshow("Track", fr)
@@ -501,14 +582,30 @@ def main():
             k = cv2.waitKey(1) & 0xFF
             if k in (ord('q'), ord('Q')):
                 break
+            elif k in (ord('r'), ord('R')):
+                pid_y.reset()
+                pid_p.reset()
+                print("[RST] PID 重置")
             elif k in (ord('o'), ord('O')):
                 use_multi_scale = not use_multi_scale
                 print(f"[TOGGLE] Multi-scale: {use_multi_scale}")
+            elif k == ord('['):
+                pid_y.kp = max(.01, pid_y.kp - .02)
+                print(f"YawKp={pid_y.kp:.2f}")
+            elif k == ord(']'):
+                pid_y.kp = min(1, pid_y.kp + .02)
+                print(f"YawKp={pid_y.kp:.2f}")
+            elif k == ord(';'):
+                pid_p.kp = max(.01, pid_p.kp - .02)
+                print(f"PitKp={pid_p.kp:.2f}")
+            elif k == ord("'"):
+                pid_p.kp = min(1, pid_p.kp + .02)
+                print(f"PitKp={pid_p.kp:.2f}")
 
     except KeyboardInterrupt:
         print("\n[INFO] 用户中断")
     finally:
-        send_gimbal_angle(0, 0)
+        send_gimbal(0, 0)
         rd.stop()
         cv2.destroyAllWindows()
         print("[EXIT] 程序退出")
