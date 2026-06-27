@@ -28,14 +28,6 @@ except ImportError:
     print("❌ 缺少依赖：av (PyAV)")
     sys.exit(1)
 
-try:
-    from ultralytics import YOLO
-    YOLO_AVAILABLE = True
-    logger.info("✅ YOLO (ultralytics) 已加载")
-except ImportError:
-    YOLO_AVAILABLE = False
-    logger.warning("⚠️ YOLO (ultralytics) 未安装，YOLO 检测功能不可用")
-
 # ==================== 配置环境 ====================
 CAMERA_IP = os.environ.get('CAMERA_IP', "192.168.144.25")
 RTSP_URL = os.environ.get('RTSP_URL', "rtsp://192.168.144.25:8554/main.264")
@@ -60,6 +52,15 @@ MIN_FRAME_INTERVAL = 0.03   # 约33 FPS
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('siyi-pos-ctrl')
+
+# YOLO 导入（在 logger 定义之后）
+try:
+    from ultralytics import YOLO
+    YOLO_AVAILABLE = True
+    logger.info("✅ YOLO (ultralytics) 已加载")
+except ImportError:
+    YOLO_AVAILABLE = False
+    logger.warning("⚠️ YOLO (ultralytics) 未安装，YOLO 检测功能不可用")
 
 # ── 全局复用 UDP Socket ──
 g_udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -738,7 +739,18 @@ async def handle_yolo_toggle(request):
     except Exception as e:
         return web.json_response({'status': 'error', 'reason': str(e)}, status=500)
 
-async def handle_status(request):
+async def handle_detector_switch(request):
+    try:
+        data = await request.json()
+        method = data.get('method', 'haar')
+        if method not in ['haar', 'lbp', 'dnn']:
+            return web.json_response({'status': 'error', 'reason': 'Invalid method.'}, status=400)
+        video_thread.face_detector._load(method)
+        return web.json_response({'status': 'success', 'active_method': video_thread.face_detector.active_method})
+    except Exception as e:
+        return web.json_response({'status': 'error', 'reason': str(e)}, status=500)
+
+async def handle_tracker_switch(request):
     try:
         data = await request.json()
         method = data.get('method', 'haar')
