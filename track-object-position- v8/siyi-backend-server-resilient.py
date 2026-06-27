@@ -25,8 +25,16 @@ from aiohttp import web, WSMsgType
 try:
     import av
 except ImportError:
-    print("❌ 缺少依赖: av (PyAV)")
+    print("❌ 缺少依赖：av (PyAV)")
     sys.exit(1)
+
+try:
+    from ultralytics import YOLO
+    YOLO_AVAILABLE = True
+    logger.info("✅ YOLO (ultralytics) 已加载")
+except ImportError:
+    YOLO_AVAILABLE = False
+    logger.warning("⚠️ YOLO (ultralytics) 未安装，YOLO 检测功能不可用")
 
 # ==================== 配置环境 ====================
 CAMERA_IP = os.environ.get('CAMERA_IP', "192.168.144.25")
@@ -36,7 +44,8 @@ SERVER_PORT = int(os.environ.get('SERVER_PORT', "8080"))
 WORKSPACE_DIR = os.environ.get('WORKSPACE_DIR', os.path.dirname(os.path.abspath(__file__)))
 
 DEFAULT_DETECTOR = os.environ.get('DETECTOR_TYPE', 'haar') 
-DEFAULT_TRACKER = os.environ.get('TRACKER_TYPE', 'hybrid') 
+DEFAULT_TRACKER = os.environ.get('TRACKER_TYPE', 'hybrid')
+YOLO_MODEL = os.environ.get('YOLO_MODEL', 'yolov8n.pt')  # YOLOv8nano 
 
 VIDEO_W = 640
 VIDEO_H = 480
@@ -94,6 +103,9 @@ class HybridControlState:
         self.manual_pitch = 0
         self.tracking_mode = 'idle' 
         self.roi_request = None
+        # YOLO 点击选择相关
+        self.yolo_click_select = None  # (click_x, click_y) 点击坐标
+        self.yolo_enabled = False  # YOLO 是否启用
 
 g_state = HybridControlState()
 
@@ -208,6 +220,95 @@ class FaceDetector:
         return []
 
 # ==================== 物体跟踪器（不变） ====================
+class YoloDetector:
+    """YOLO 物体检测器 - 支持单击选择目标"""
+    def __init__(self, model_name='yolov8n.pt'):
+        self.model = None
+        self.model_name = model_name
+        self.active = False
+        self detections = []  # 当前检测结果
+        if YOLO_AVAILABLE:
+            self._load(model_name)
+    
+    def _load(self, model_name):
+        try:
+            self.model = YOLO(model_name)
+            self.model.to('cpu')  # 使用 CPU
+            self.active = True
+            logger.info(f"✅ YOLO 检测器加载成功：{model_name}")
+        except Exception as e:
+            logger.error(f"❌ YOLO 模型加载失败：{e}")
+            self.active = False
+    
+    def detect(self, frame, confidence=0.5):
+        """检测帧中的物体，返回检测结果列表"""
+        if not self.active or self.model is None:
+            return []
+        
+        try:
+            results = self.model(frame, conf=confidence, verbose=False)
+            detections = []
+            for r in results:
+                boxes = r.boxes
+                if boxes is None:
+                    continue
+                for box in boxes:
+                    x1, y1, x2, y2 = box.xyxy[0].tolist()
+                    cls = int(box.cls[0])
+                    conf = float(box.conf[0])
+                    class_name = self.model.names[cls]
+                    detections.append({
+                        'bbox': (int(x1), int(y1), int(x2-x1), int(y2-y1)),
+                        'class': class_name,
+                        'confidence': conf,
+                        'center': (int((x1+x2)/2), int((y1+y2)/2))
+                    })
+            self.detections = detections
+            return detections
+        except Exception as e:
+            logger.error(f"YOLO 检测异常：{e}")
+            return []
+    
+    def draw_detections(self, frame, detections=None):
+        """在帧上绘制检测结果"""
+        if detections is None:
+            detections = self.detections
+        
+        for det in detections:
+            x, y, w, h = det['bbox']
+            cls = det['class']
+            conf = det['confidence']
+            
+            # 绘制边界框
+            cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 255), 2)
+            
+            # 绘制标签
+            label = f"{cls} {conf:.2f}"
+            cv2.putText(frame, label, (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+            
+            # 绘制中心点
+            cx, cy = det['center']
+            cv2.circle(frame, (cx, cy), 4, (0, 0, 255), -1)
+        
+        return frame
+    
+    def find_nearest_detection(self, click_x, click_y, max_distance=100):
+        """找到距离点击位置最近的检测结果"""
+        if not self.detections:
+            return None
+        
+        min_dist = float('inf')
+        nearest = None
+        
+        for det in self.detections:
+            cx, cy = det['center']
+            dist = ((cx - click_x)**2 + (cy - click_y)**2)**0.5
+            if dist < min_dist and dist <= max_distance:
+                min_dist = dist
+                nearest = det
+        
+        return nearest
+
 class ObjectTracker:
     # ... 保持原样，省略以节省篇幅，实际使用时需复制完整代码 ...
     def __init__(self, method='hybrid'):
@@ -365,6 +466,7 @@ class VideoAndTrackingThread(threading.Thread):
         
         self.face_detector = FaceDetector(method=DEFAULT_DETECTOR)
         self.object_tracker = ObjectTracker(method=DEFAULT_TRACKER)
+        self.yolo_detector = YoloDetector(model_name=YOLO_MODEL)
             
         self.last_control_t = time.time()
         self.tracking_mode = 'idle' 
@@ -372,6 +474,7 @@ class VideoAndTrackingThread(threading.Thread):
         self.obj_lost_count = 0
         self.smooth_fx = 0.0
         self.smooth_fy = 0.0
+        self.yolo_active = False  # YOLO 是否激活
 
     def run(self):
         frame_counter = 0
@@ -407,8 +510,29 @@ class VideoAndTrackingThread(threading.Thread):
                                 self.roi_to_init = g_state.roi_request
                                 g_state.roi_request = None
 
+                        # 处理 YOLO 点击选择
+                        with g_state.lock:
+                            if g_state.yolo_click_select is not None and self.yolo_active:
+                                click_x, click_y = g_state.yolo_click_select
+                                g_state.yolo_click_select = None
+                                
+                                # 在点击位置附近查找 YOLO 检测结果
+                                nearest = self.yolo_detector.find_nearest_detection(click_x, click_y, max_distance=150)
+                                if nearest:
+                                    bbox = nearest['bbox']
+                                    self.roi_to_init = (bbox[0]/VIDEO_W, bbox[1]/VIDEO_H, bbox[2]/VIDEO_W, bbox[3]/VIDEO_H)
+                                    logger.info(f"🎯 YOLO 点击选择：{nearest['class']} (conf={nearest['confidence']:.2f})")
+                                else:
+                                    logger.info(f"⚠️ 点击位置未检测到物体")
+
                         if is_manual:
-                            cv2.putText(bgr_img, "MODE: MANUAL CONTROL", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                            # YOLO 检测模式 - 显示检测结果
+                            if self.yolo_active:
+                                detections = self.yolo_detector.detect(bgr_img, confidence=0.5)
+                                bgr_img = self.yolo_detector.draw_detections(bgr_img, detections)
+                                cv2.putText(bgr_img, "MODE: YOLO DETECTION (Click to Select)", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                            else:
+                                cv2.putText(bgr_img, "MODE: MANUAL CONTROL", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
                         else:
                             if self.roi_to_init is not None:
                                 rx, ry, rw, rh = self.roi_to_init
@@ -579,7 +703,42 @@ async def handle_tracker_reset(request):
     video_thread.roi_to_init = None
     return web.json_response({'status': 'success'})
 
-async def handle_detector_switch(request):
+async def handle_yolo_click_select(request):
+    """处理 YOLO 点击选择 - 左键单击"""
+    try:
+        data = await request.json()
+        click_x = float(data.get('x', 0))
+        click_y = float(data.get('y', 0))
+        
+        if not video_thread.yolo_detector.active:
+            return web.json_response({'status': 'error', 'reason': 'YOLO not available'}, status=503)
+        
+        with g_state.lock:
+            g_state.yolo_click_select = (click_x, click_y)
+        
+        return web.json_response({'status': 'success'})
+    except Exception as e:
+        return web.json_response({'status': 'error', 'reason': str(e)}, status=500)
+
+async def handle_yolo_toggle(request):
+    """切换 YOLO 检测开关"""
+    try:
+        data = await request.json()
+        enabled = data.get('enabled', True)
+        
+        video_thread.yolo_active = enabled
+        with g_state.lock:
+            g_state.yolo_enabled = enabled
+        
+        return web.json_response({
+            'status': 'success', 
+            'yolo_active': video_thread.yolo_active,
+            'yolo_available': video_thread.yolo_detector.active
+        })
+    except Exception as e:
+        return web.json_response({'status': 'error', 'reason': str(e)}, status=500)
+
+async def handle_status(request):
     try:
         data = await request.json()
         method = data.get('method', 'haar')
@@ -605,6 +764,7 @@ async def handle_status(request):
     with g_state.lock:
         tgt_y = g_state.target_yaw
         tgt_p = g_state.target_pitch
+        yolo_en = g_state.yolo_enabled
     return web.json_response({
         'rtsp_connected': video_thread.connected, 
         'system_mode': 'manual' if g_state.manual_mode else 'auto',
@@ -612,7 +772,10 @@ async def handle_status(request):
         'detector_type': video_thread.face_detector.active_method,
         'tracker_type': video_thread.object_tracker.active_method,
         'target_yaw': round(tgt_y, 2),
-        'target_pitch': round(tgt_p, 2)
+        'target_pitch': round(tgt_p, 2),
+        'yolo_active': video_thread.yolo_active,
+        'yolo_available': video_thread.yolo_detector.active,
+        'yolo_enabled': yolo_en
     })
 
 async def handle_static(request):
@@ -649,6 +812,8 @@ async def init_app():
     app.router.add_post('/api/gimbal/control', handle_gimbal_control)
     app.router.add_post('/api/tracker/init', handle_tracker_init)
     app.router.add_post('/api/tracker/reset', handle_tracker_reset)
+    app.router.add_post('/api/yolo/click', handle_yolo_click_select)
+    app.router.add_post('/api/yolo/toggle', handle_yolo_toggle)
     app.router.add_post('/api/detector/switch', handle_detector_switch)
     app.router.add_post('/api/tracker/switch', handle_tracker_switch)
     app.router.add_get('/api/status', handle_status)

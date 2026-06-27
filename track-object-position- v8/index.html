@@ -93,6 +93,7 @@
                     <button class="btn btn-primary" onclick="centerGimbal()">🎯 云台回中</button>
                     <button class="btn btn-warning" id="btnSelectRoi" onclick="enableRoiSelection()">🖱️ 框选目标</button>
                     <button class="btn btn-primary" onclick="resetTracking()">🔄 重置跟踪</button>
+                    <button class="btn btn-primary" id="btnYoloToggle" onclick="toggleYolo(!yoloEnabled)" disabled>🔍 YOLO 检测</button>
                     <button class="btn btn-danger" id="btnStop" onclick="stopService()" disabled style="grid-column: span 2;">⏹ 停止服务</button>
                 </div>
                 
@@ -127,6 +128,8 @@
                     <h3>⌨️ 键盘与鼠标控制</h3>
                     <div class="key-row"><span><span class="key">W</span> 上 <span class="key">S</span> 下 <span class="key">A</span> 左 <span class="key">D</span> 右</span></div>
                     <div class="key-row"><span><span class="key">Shift</span> 加速 | <span class="key">Space</span> 回中</span></div>
+                    <div class="key-row"><span style="color:#00ff88;">🖱️ 左键：YOLO 模式单击选择目标 | 普通模式手动控制</span></div>
+                    <div class="key-row"><span style="color:#ff6b6b;">🖱️ 右键：取消跟踪（停止所有跟踪）</span></div>
                     <div class="key-row"><span style="color:#ffd43b;">💡 提示：框选人脸自动人脸跟踪，框选物体自动物体跟踪！</span></div>
                 </div>
             </div>
@@ -144,12 +147,16 @@
         let mouseCurrentPitchSpeed = 0;
         let mouseLoopInterval = null; 
 
-        let isRoiModeActive = false; 
+let isRoiModeActive = false; 
         let isDrawing = false;       
         let startX = 0, startY = 0;   
         let currentX = 0, currentY = 0; 
-        let savedRoi = null;         
-
+        
+        // YOLO 相关
+        let yoloEnabled = false;
+        let yoloAvailable = false;
+        
+        let savedRoi = null;
         const canvas = document.getElementById('interactionCanvas');
         const ctx = canvas.getContext('2d');
         
@@ -310,19 +317,44 @@
             const clientX = e.clientX - rect.left;
             const clientY = e.clientY - rect.top;
 
-            if (isRoiModeActive) {
-                startX = currentX = clientX;
-                startY = currentY = clientY;
-                isDrawing = true;
-            } else {
-                isMouseGimbalInteracting = true;
-                calculateMouseSpeed(clientX, clientY, rect.width, rect.height);
-                if (mouseLoopInterval) clearInterval(mouseLoopInterval);
-                sendGimbal(mouseCurrentYawSpeed, mouseCurrentPitchSpeed);
-                mouseLoopInterval = setInterval(() => {
-                    if (isMouseGimbalInteracting) sendGimbal(mouseCurrentYawSpeed, mouseCurrentPitchSpeed);
-                }, 50);
+            // 右键点击 - 取消跟踪
+            if (e.button === 2) {
+                e.preventDefault();
+                resetTracking();
+                log('🖱️ 右键：已取消跟踪', 'info');
+                return;
             }
+
+            // 左键点击
+            if (e.button === 0) {
+                // YOLO 模式 - 单击选择目标
+                if (yoloEnabled && yoloAvailable) {
+                    submitYoloClickSelect(clientX, clientY);
+                    return;
+                }
+                
+                // 框选模式
+                if (isRoiModeActive) {
+                    startX = currentX = clientX;
+                    startY = currentY = clientY;
+                    isDrawing = true;
+                } else {
+                    // 普通手动控制
+                    isMouseGimbalInteracting = true;
+                    calculateMouseSpeed(clientX, clientY, rect.width, rect.height);
+                    if (mouseLoopInterval) clearInterval(mouseLoopInterval);
+                    sendGimbal(mouseCurrentYawSpeed, mouseCurrentPitchSpeed);
+                    mouseLoopInterval = setInterval(() => {
+                        if (isMouseGimbalInteracting) sendGimbal(mouseCurrentYawSpeed, mouseCurrentPitchSpeed);
+                    }, 50);
+                }
+            }
+        });
+
+        // 禁用右键菜单
+        canvas.addEventListener('contextmenu', (e) => {
+            e.preventDefault();
+            return false;
         });
 
         canvas.addEventListener('mousemove', (e) => {
@@ -387,6 +419,42 @@
             }
         }
 
+        async function submitYoloClickSelect(x, y) {
+            try {
+                const response = await fetch('/api/yolo/click', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ x, y })
+                });
+                const res = await response.json();
+                if (res.status === 'success') {
+                    log('🎯 YOLO: 正在识别点击位置的目标...', 'info');
+                } else {
+                    log('❌ YOLO 选择失败：' + (res.reason || '未检测到目标'), 'error');
+                }
+            } catch (e) {
+                log('❌ YOLO 选择请求失败', 'error');
+            }
+        }
+
+        async function toggleYolo(enabled) {
+            try {
+                const response = await fetch('/api/yolo/toggle', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ enabled: enabled })
+                });
+                const res = await response.json();
+                if (res.status === 'success') {
+                    yoloEnabled = res.yolo_active;
+                    yoloAvailable = res.yolo_available;
+                    log(`🔍 YOLO ${enabled ? '已启用' : '已禁用'} (可用：${yoloAvailable ? '是' : '否'})`, 'success');
+                }
+            } catch (e) {
+                log('❌ YOLO 切换失败', 'error');
+            }
+        }
+
         async function sendGimbal(yaw, pitch) {
             yaw = Math.max(-100, Math.min(100, parseInt(yaw || 0)));
             pitch = Math.max(-100, Math.min(100, parseInt(pitch || 0)));
@@ -416,6 +484,7 @@
             serviceRunning = true;
             document.getElementById('btnStart').disabled = true;
             document.getElementById('btnStop').disabled = false;
+            document.getElementById('btnYoloToggle').disabled = false;
             document.getElementById('mainStatus').textContent = '● 运行中';
             document.getElementById('mainStatus').style.color = '#00ff88';
             log('🚀 服务启动成功，当前处于待机状态', 'success');
@@ -433,6 +502,9 @@
             isMouseGimbalInteracting = false;
             document.getElementById('btnStart').disabled = false;
             document.getElementById('btnStop').disabled = true;
+            document.getElementById('btnYoloToggle').disabled = true;
+            yoloEnabled = false;
+            document.getElementById('btnYoloToggle').classList.remove('btn-active-hunting');
             document.getElementById('mainStatus').textContent = '已停止';
             document.getElementById('mainStatus').style.color = '#ff6b6b';
             resetTracking();
@@ -478,6 +550,29 @@
                     } else {
                         modeEl.textContent = '⏸️ 待机中 (请框选目标)';
                         modeEl.className = 'mode-indicator mode-idle';
+                    }
+                }
+                
+                // 更新 YOLO 状态
+                if (data.yolo_available !== undefined) {
+                    yoloAvailable = data.yolo_available;
+                    yoloEnabled = data.yolo_enabled || false;
+                    
+                    const yoloBtn = document.getElementById('btnYoloToggle');
+                    if (yoloAvailable) {
+                        yoloBtn.disabled = false;
+                        if (yoloEnabled) {
+                            yoloBtn.classList.add('btn-active-hunting');
+                            yoloBtn.textContent = '🔍 YOLO 检测 ✓';
+                            canvas.style.cursor = 'pointer';
+                        } else {
+                            yoloBtn.classList.remove('btn-active-hunting');
+                            yoloBtn.textContent = '🔍 YOLO 检测';
+                            canvas.style.cursor = 'default';
+                        }
+                    } else {
+                        yoloBtn.disabled = true;
+                        yoloBtn.textContent = '🔍 YOLO 不可用';
                     }
                 }
                 

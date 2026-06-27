@@ -1,62 +1,20 @@
 #!/usr/bin/env python3
-"""
-SIYI A8 Mini 网页版后端服务 - 终极位置控制版 (优化响应速度)
-优化项：
-- K_PX_TO_DEG: 0.12 → 0.22
-- DEADZONE_PX: 10 → 5
-- 平滑系数: 0.7 → 0.5
-- 发送频率: 20Hz → 30Hz
-- dt 上限: 0.1s → 0.15s
-"""
-
-import asyncio
-import json
+"""实例五（框选区域YOLO版·修复立即丢失）：集成DKF+Kalman，放宽匹配条件"""
+import cv2
 import socket
 import struct
-import logging
-import os
-import sys
-import threading
 import time
-import numpy as np
-import cv2
-from aiohttp import web, WSMsgType
+import os
+import math
+from ultralytics import YOLO
 
-try:
-    import av
-except ImportError:
-    print("❌ 缺少依赖: av (PyAV)")
-    sys.exit(1)
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|buffer_size;2048000"
 
-# ==================== 配置环境 ====================
-CAMERA_IP = os.environ.get('CAMERA_IP', "192.168.144.25")
-RTSP_URL = os.environ.get('RTSP_URL', "rtsp://192.168.144.25:8554/main.264")
-UDP_PORT = int(os.environ.get('UDP_PORT', "37260"))
-SERVER_PORT = int(os.environ.get('SERVER_PORT', "8080"))
-WORKSPACE_DIR = os.environ.get('WORKSPACE_DIR', os.path.dirname(os.path.abspath(__file__)))
+CAMERA_IP = "192.168.144.25"
+UDP_PORT = 37260
+RTSP_URL = "rtsp://192.168.144.25:8554/main.264"
 
-DEFAULT_DETECTOR = os.environ.get('DETECTOR_TYPE', 'haar') 
-DEFAULT_TRACKER = os.environ.get('TRACKER_TYPE', 'hybrid') 
-
-VIDEO_W = 640
-VIDEO_H = 480
-
-# ── 位置控制核心参数（优化版） ──
-K_PX_TO_DEG = 0.22          # 增大系数，加快响应
-DEADZONE_PX = 5             # 减小死区，更敏感
-MANUAL_SPEED_DEG_PER_SEC = 80.0  # 手动速度也相应提升
-REVERSE_PITCH = True        # 如果上下方向反了，请改为 False
-
-MIN_FRAME_INTERVAL = 0.03   # 约33 FPS
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger('siyi-pos-ctrl')
-
-# ── 全局复用 UDP Socket ──
-g_udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-
-# ==================== SIYI 协议封装 (CMD 0x0E) ====================
-def calculate_crc16_xmodem(data: bytes) -> bytes:
+def calculate_crc16_xmodem(data):
     crc = 0x0000
     for byte in data:
         crc ^= (byte << 8)
@@ -66,9 +24,9 @@ def calculate_crc16_xmodem(data: bytes) -> bytes:
             else:
                 crc <<= 1
     crc &= 0xFFFF
-    return crc.to_bytes(2, byteorder='little')
+    return crc.to_bytes(2, 'little')
 
-def build_position_cmd(yaw_deg: float, pitch_deg: float, reverse_pitch: bool = False) -> bytes:
+def build_position_cmd(yaw_deg, pitch_deg, reverse_pitch=True):
     header = bytes.fromhex("556601040000000E")
     yaw_val = int(yaw_deg * 10)
     pitch_val = int(pitch_deg * 10)
@@ -76,591 +34,524 @@ def build_position_cmd(yaw_deg: float, pitch_deg: float, reverse_pitch: bool = F
         pitch_val = -pitch_val
     yaw_val = max(-32768, min(32767, yaw_val))
     pitch_val = max(-32768, min(32767, pitch_val))
-    yaw_bytes = yaw_val.to_bytes(2, byteorder='little', signed=True)
-    pitch_bytes = pitch_val.to_bytes(2, byteorder='little', signed=True)
+    yaw_bytes = struct.pack('<h', yaw_val)
+    pitch_bytes = struct.pack('<h', pitch_val)
     payload = header + yaw_bytes + pitch_bytes
     crc = calculate_crc16_xmodem(payload)
     return payload + crc
 
-# ==================== 全局控制状态 ====================
-class HybridControlState:
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.target_yaw = 0.0
-        self.target_pitch = 0.0
-        self.last_manual_time = 0.0
-        self.manual_mode = False
-        self.manual_yaw = 0
-        self.manual_pitch = 0
-        self.tracking_mode = 'idle' 
-        self.roi_request = None
+K_PX_TO_DEG = 0.28
+DEADZONE_PX = 5
+SMOOTH_ALPHA = 0.5
+DT_MAX = 0.15
+REVERSE_PITCH = True
+MANUAL_SPEED_DEG_PER_SEC = 80.0
+KEY_TIMEOUT = 0.2
+MANUAL_IDLE_TIMEOUT = 1.0
 
-g_state = HybridControlState()
+# ========== DKF 滤波器 ==========
+class DKFFilter:
+    def __init__(self, q=1.0, r=10.0, p_init=100.0):
+        self.q = q
+        self.r = r
+        self.p_init = p_init
+        self.reset()
 
-# ==================== 独立发送线程 (30Hz) ====================
-def send_loop():
-    logger.info("🚀 30Hz 位置发送线程启动 (CMD 0x0E)")
-    last_time = time.time()
-    while video_thread.running:
-        now = time.time()
-        dt = now - last_time
-        last_time = now
-        
-        with g_state.lock:
-            if g_state.manual_mode:
-                g_state.target_yaw += (g_state.manual_yaw / 100.0) * MANUAL_SPEED_DEG_PER_SEC * dt
-                g_state.target_pitch += (g_state.manual_pitch / 100.0) * MANUAL_SPEED_DEG_PER_SEC * dt
-                g_state.target_yaw = max(-135.0, min(135.0, g_state.target_yaw))
-                # pitch 不限幅
-            tgt_y = g_state.target_yaw
-            tgt_p = g_state.target_pitch
-        
-        cmd = build_position_cmd(tgt_y, tgt_p, reverse_pitch=REVERSE_PITCH)
-        try:
-            g_udp_socket.sendto(cmd, (CAMERA_IP, UDP_PORT))
-        except Exception as e:
-            logger.error(f"UDP 发送失败: {e}")
-        time.sleep(0.033)  # 30Hz
+    def reset(self):
+        self.x = None
+        self.P = None
+        self.initialized = False
 
-# ==================== 人脸检测器（不变） ====================
-class FaceDetector:
-    # ... 保持原样 ...
-    def __init__(self, method='haar'):
-        self.method = method
-        self.detector = None
-        self.dnn_net = None
-        self.yunet = None
-        self.active_method = 'none'
-        self._load(method)
-        
-    def _find_file(self, filename):
-        paths = [
-            os.path.join(WORKSPACE_DIR, filename),
-            os.path.join(os.path.expanduser('~'), '.opencv', filename),
-            f'/usr/share/opencv4/haarcascades/{filename}' if 'cascade' in filename else filename,
-            f'/usr/local/share/opencv4/haarcascades/{filename}' if 'cascade' in filename else filename,
-        ]
-        for p in paths:
-            if os.path.exists(p): return p
-        return None
+    def init_from_bbox(self, bbox):
+        x1, y1, x2, y2 = bbox
+        cx = (x1 + x2) / 2.0
+        cy = (y1 + y2) / 2.0
+        w = x2 - x1
+        h = y2 - y1
+        self.x = [cx, cy, w, h, 0.0, 0.0, 0.0, 0.0]
+        self.P = [[self.p_init]*8 for _ in range(8)]
+        self.initialized = True
+        return True
 
-    def _load(self, method):
-        self.method = method
-        if method == 'haar':
-            path = self._find_file('haarcascade_frontalface_default.xml')
-            if path: 
-                self.detector = cv2.CascadeClassifier(path)
-                self.active_method = 'haar'
-                logger.info(f"✅ 加载 Haar 人脸检测器成功")
-            else: logger.error("❌ 未找到 Haar 模型文件")
-        elif method == 'lbp':
-            path = self._find_file('lbpcascade_frontalface.xml')
-            if path: 
-                self.detector = cv2.CascadeClassifier(path)
-                self.active_method = 'lbp'
-                logger.info(f"✅ 加载 LBP 人脸检测器成功")
-            else:
-                logger.warning("⚠️ 未找到 LBP 模型文件，自动降级为 Haar")
-                self._load('haar')
-        elif method == 'dnn':
-            try:
-                path = self._find_file('face_detection_yunet_2023mar.onnx')
-                if path:
-                    self.yunet = cv2.FaceDetectorYN.create(path, "", (VIDEO_W, VIDEO_H), 0.9, 0.3, 5000)
-                    self.active_method = 'dnn_yunet'
-                    logger.info(f"✅ 加载 DNN (YuNet) 人脸检测器成功 (高精度)")
-                    return
-            except AttributeError: pass
-            prototxt = self._find_file('deploy.prototxt')
-            model = self._find_file('res10_300x300_ssd_iter_140000.caffemodel')
-            if prototxt and model:
-                self.dnn_net = cv2.dnn.readNetFromCaffe(prototxt, model)
-                self.active_method = 'dnn_ssd'
-                logger.info(f"✅ 加载 DNN (SSD) 人脸检测器成功 (高精度)")
-                return
-            logger.warning("⚠️ 未找到 DNN 模型文件，自动降级为 Haar。")
-            self._load('haar')
+    def predict(self, dt):
+        if not self.initialized:
+            return
+        F = [[1,0,0,0,dt,0,0,0],
+             [0,1,0,0,0,dt,0,0],
+             [0,0,1,0,0,0,dt,0],
+             [0,0,0,1,0,0,0,dt],
+             [0,0,0,0,1,0,0,0],
+             [0,0,0,0,0,1,0,0],
+             [0,0,0,0,0,0,1,0],
+             [0,0,0,0,0,0,0,1]]
+        new_x = [0.0]*8
+        for i in range(8):
+            s = 0.0
+            for j in range(8):
+                s += F[i][j] * self.x[j]
+            new_x[i] = s
+        self.x = new_x
+        dt2 = dt*dt
+        for i in range(8):
+            self.P[i][i] += self.q * (dt2 if i<4 else dt)
 
-    def detect(self, frame):
-        if self.active_method in ['haar', 'lbp'] and self.detector is not None:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            faces = self.detector.detectMultiScale(gray, 1.15, 5, minSize=(40, 40))
-            return faces if len(faces) > 0 else []
-        elif self.active_method == 'dnn_yunet' and self.yunet is not None:
-            h, w = frame.shape[:2]
-            self.yunet.setInputSize((w, h))
-            _, faces = self.yunet.detect(frame)
-            if faces is None: return []
-            return [(int(f[0]), int(f[1]), int(f[2]), int(f[3])) for f in faces]
-        elif self.active_method == 'dnn_ssd' and self.dnn_net is not None:
-            h, w = frame.shape[:2]
-            blob = cv2.dnn.blobFromImage(cv2.resize(frame, (300, 300)), 1.0, (300, 300), (104.0, 177.0, 123.0))
-            self.dnn_net.setInput(blob)
-            detections = self.dnn_net.forward()
-            faces = []
-            for i in range(detections.shape[2]):
-                confidence = detections[0, 0, i, 2]
-                if confidence > 0.5:
-                    box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
-                    (x, y, x1, y1) = box.astype("int")
-                    faces.append((int(x), int(y), int(x1-x), int(y1-y)))
-            return faces
+    def update(self, measurement, dt):
+        if not self.initialized:
+            return
+        z = list(measurement)
+        for i in range(4):
+            innov = z[i] - self.x[i]
+            p = self.P[i][i] + self.r
+            k = self.P[i][i] / p
+            self.x[i] += k * innov
+            self.x[i+4] += k * innov / max(0.01, dt)
+            self.P[i][i] = (1 - k) * self.P[i][i]
+
+    def get_bbox(self):
+        if not self.initialized:
+            return None
+        cx, cy, w, h = self.x[0], self.x[1], self.x[2], self.x[3]
+        x1 = cx - w/2
+        y1 = cy - h/2
+        x2 = cx + w/2
+        y2 = cy + h/2
+        return (x1, y1, x2, y2)
+
+    def get_center(self):
+        if not self.initialized:
+            return None
+        return (self.x[0], self.x[1])
+
+    def get_velocity(self):
+        if not self.initialized:
+            return (0.0, 0.0)
+        return (self.x[4], self.x[5])
+
+# ========== Kalman 预测器 ==========
+class KalmanTargetPredictor:
+    def __init__(self, process_noise=50.0, measurement_noise=25.0):
+        self.Q = process_noise
+        self.R = measurement_noise
+        self.reset()
+
+    def reset(self):
+        self.x = None
+        self.P = None
+        self.initialized = False
+
+    def init(self, cx, cy):
+        self.x = [cx, cy, 0.0, 0.0]
+        self.P = [[100.0,0,0,0],
+                  [0,100.0,0,0],
+                  [0,0,10000.0,0],
+                  [0,0,0,10000.0]]
+        self.initialized = True
+
+    def predict(self, dt):
+        if not self.initialized:
+            return
+        F = [[1,0,dt,0],
+             [0,1,0,dt],
+             [0,0,1,0],
+             [0,0,0,1]]
+        new_x = [0.0]*4
+        for i in range(4):
+            s = 0.0
+            for j in range(4):
+                s += F[i][j] * self.x[j]
+            new_x[i] = s
+        self.x = new_x
+        for i in range(4):
+            self.P[i][i] += self.Q * (dt*dt if i<2 else dt)
+
+    def update(self, cx, cy, dt):
+        if not self.initialized:
+            self.init(cx, cy)
+            return
+        innov_x = cx - self.x[0]
+        innov_y = cy - self.x[1]
+        p00 = self.P[0][0] + self.R
+        p11 = self.P[1][1] + self.R
+        kx = self.P[0][0] / p00
+        ky = self.P[1][1] / p11
+        self.x[0] += kx * innov_x
+        self.x[1] += ky * innov_y
+        self.x[2] += kx * innov_x / max(0.01, dt)
+        self.x[3] += ky * innov_y / max(0.01, dt)
+        self.P[0][0] = (1-kx) * self.P[0][0]
+        self.P[1][1] = (1-ky) * self.P[1][1]
+
+    def predict_future(self, ahead_sec):
+        if not self.initialized:
+            return None
+        cx = self.x[0] + self.x[2] * ahead_sec
+        cy = self.x[1] + self.x[3] * ahead_sec
+        return (cx, cy)
+
+# ========== YOLO 初始化 ==========
+yolo = YOLO('yolov8n.pt')
+yolo.conf = 0.5  # 框选检测阈值
+
+mouse_data = {'active': False, 'yaw_speed': 0.0, 'pitch_speed': 0.0, 'last_move_time': 0.0}
+tracking_bbox = None
+tracking_mode = False
+smooth_fx, smooth_fy = 0.0, 0.0
+
+selecting = False
+selection_rect = None
+waiting_select = False
+region_detections = []
+region_detected = False
+
+latest_frame = None
+
+dkf = DKFFilter(q=0.5, r=5.0, p_init=100.0)
+kalman = KalmanTargetPredictor(process_noise=30.0, measurement_noise=15.0)
+
+lost_count = 0
+MAX_LOST_FRAMES = 8
+PREDICT_AHEAD_MS = 80
+
+# 跟踪开始帧计数器（用于第一帧特殊处理）
+track_start_frames = 0
+
+def run_yolo_on_region(frame, rect):
+    x1, y1, x2, y2 = rect
+    roi = frame[y1:y2, x1:x2]
+    if roi.size == 0:
         return []
+    results = yolo(roi, verbose=False, imgsz=320)
+    dets = results[0].boxes
+    detections = []
+    if dets is not None:
+        for box in dets:
+            bx1, by1, bx2, by2 = box.xyxy[0].cpu().numpy().astype(int)
+            conf = box.conf.item()
+            cls_id = int(box.cls.item())
+            detections.append((bx1 + x1, by1 + y1, bx2 + x1, by2 + y1, conf, cls_id))
+    return detections
 
-# ==================== 物体跟踪器（不变） ====================
-class ObjectTracker:
-    # ... 保持原样，省略以节省篇幅，实际使用时需复制完整代码 ...
-    def __init__(self, method='hybrid'):
-        self.method = method
-        self.tracker = None
-        self.dnn_net = None
-        self.active_method = 'none'
-        self.fast_tracker = None      
-        self.accurate_tracker = None  
-        self.calibrate_interval = 5   
-        self.frame_count = 0
-        self.last_fast_bbox = None
-        self.last_accurate_bbox = None
-        self.ssd_blob_params = None 
-        self._load(method)
+def mouse_callback(event, x, y, flags, param):
+    global mouse_data, tracking_bbox, tracking_mode, smooth_fx, smooth_fy
+    global selecting, selection_rect, waiting_select, region_detections, region_detected, latest_frame, lost_count, track_start_frames
 
-    def _find_file(self, filename):
-        paths = [os.path.join(WORKSPACE_DIR, filename), os.path.join(os.path.expanduser('~'), '.opencv', filename)]
-        for p in paths:
-            if os.path.exists(p): return p
-        return None
+    if event == cv2.EVENT_LBUTTONDBLCLK:
+        if tracking_mode:
+            tracking_mode = False; tracking_bbox = None; lost_count = 0; dkf.reset(); kalman.reset(); track_start_frames = 0; print("双击取消跟踪")
+        if waiting_select or selecting:
+            selecting = False; waiting_select = False; selection_rect = None
+            region_detections = []; region_detected = False; print("双击清除框选")
+        if mouse_data['active']:
+            mouse_data['active'] = False; mouse_data['yaw_speed'] = 0.0; mouse_data['pitch_speed'] = 0.0
+            print("双击退出手动控制")
+        return
 
-    def _create_legacy_tracker(self, name):
-        try: return getattr(cv2.legacy, f'Tracker{name}_create')()
-        except AttributeError: pass
-        try: return getattr(cv2, f'Tracker{name}_create')()
-        except AttributeError: pass
-        return None
+    if event == cv2.EVENT_LBUTTONDOWN:
+        if waiting_select:
+            hit = False
+            for det in region_detections:
+                x1, y1, x2, y2, conf, cls_id = det
+                if x1 <= x <= x2 and y1 <= y <= y2:
+                    tracking_bbox = (x1, y1, x2-x1, y2-y1)
+                    tracking_mode = True
+                    lost_count = 0
+                    track_start_frames = 0
+                    smooth_fx = (x1+x2)/2; smooth_fy = (y1+y2)/2
+                    dkf.init_from_bbox(tracking_bbox)
+                    kalman.init(smooth_fx, smooth_fy)
+                    print(f"✅ 开始跟踪目标: 类别 {cls_id}, 置信度 {conf:.2f}")
+                    waiting_select = False; selection_rect = None; region_detections = []; region_detected = False
+                    hit = True; break
+            if not hit:
+                waiting_select = False; selection_rect = None; region_detections = []; region_detected = False
+                print("点击空白，取消框选")
+            return
 
-    def _calculate_iou(self, boxA, boxB):
-        xA = max(boxA[0], boxB[0]); yA = max(boxA[1], boxB[1])
-        xB = min(boxA[0] + boxA[2], boxB[0] + boxB[2]); yB = min(boxA[1] + boxA[3], boxB[1] + boxB[3])
-        interArea = max(0, xB - xA) * max(0, yB - yA)
-        boxAArea = boxA[2] * boxA[3]; boxBArea = boxB[2] * boxB[3]
-        return interArea / float(boxAArea + boxBArea - interArea + 1e-5)
+        selecting = True
+        selection_rect = (x, y, x, y)
+        if tracking_mode:
+            tracking_mode = False; tracking_bbox = None; lost_count = 0; dkf.reset(); kalman.reset(); track_start_frames = 0; print("框选开始，停止跟踪")
+        region_detections = []; region_detected = False
+        return
 
-    def _load(self, method):
-        self.method = method
-        self.frame_count = 0; self.last_fast_bbox = None; self.last_accurate_bbox = None; self.ssd_blob_params = None
-        if method == 'hybrid':
-            self.fast_tracker = self._create_legacy_tracker('MOSSE')
-            self.accurate_tracker = self._create_legacy_tracker('CSRT')
-            if self.fast_tracker and self.accurate_tracker: self.active_method = 'hybrid'; logger.info(f"✅ 加载 Hybrid")
-            else: self._fallback_tracker('Hybrid')
-        elif method == 'mosse':
-            self.tracker = self._create_legacy_tracker('MOSSE')
-            if self.tracker: self.active_method = 'mosse'; logger.info("✅ 加载 MOSSE")
-            else: self._fallback_tracker('MOSSE')
-        elif method == 'kcf':
-            self.tracker = self._create_legacy_tracker('KCF')
-            if self.tracker: self.active_method = 'kcf'; logger.info("✅ 加载 KCF")
-            else: self._fallback_tracker('KCF')
-        elif method == 'csrt':
-            self.tracker = self._create_legacy_tracker('CSRT')
-            if self.tracker: self.active_method = 'csrt'; logger.info("✅ 加载 CSRT")
-            else: self._fallback_tracker('CSRT')
-        elif method == 'dasiamrpn':
-            model = self._find_file('dasiamrpn_model.onnx')
-            kernel_cls1 = self._find_file('dasiamrpn_kernel_cls1.onnx')
-            kernel_r1 = self._find_file('dasiamrpn_kernel_r1.onnx')
-            if model and kernel_cls1 and kernel_r1:
-                try:
-                    params = cv2.TrackerDaSiamRPN_Params()
-                    params.model = model; params.kernel_cls1 = kernel_cls1; params.kernel_r1 = kernel_r1
-                    self.tracker = cv2.TrackerDaSiamRPN_create(params)
-                    self.active_method = 'dasiamrpn'; logger.info("✅ 加载 DaSiamRPN")
-                except: self._fallback_tracker('DaSiamRPN')
-            else: self._load('hybrid')
-        elif method == 'ssd':
-            prototxt = self._find_file('deploy.prototxt')
-            model = self._find_file('res10_300x300_ssd_iter_140000.caffemodel')
-            if prototxt and model:
-                try:
-                    self.dnn_net = cv2.dnn.readNetFromCaffe(prototxt, model)
-                    self.ssd_blob_params = {'scale': 1.0, 'mean': (104.0, 177.0, 123.0)}
-                    self.active_method = 'ssd'; logger.info("✅ 加载 SSD")
-                except: self._fallback_tracker('SSD')
-            else: self._load('hybrid')
+    if event == cv2.EVENT_MOUSEMOVE and selecting:
+        x1, y1, _, _ = selection_rect
+        selection_rect = (x1, y1, x, y)
+        return
 
-    def _fallback_tracker(self, failed_name):
-        for fallback in ['hybrid', 'csrt', 'kcf', 'mosse']:
-            if fallback == 'hybrid':
-                self.fast_tracker = self._create_legacy_tracker('MOSSE')
-                self.accurate_tracker = self._create_legacy_tracker('CSRT')
-                if self.fast_tracker and self.accurate_tracker: self.active_method = 'hybrid'; return
+    if event == cv2.EVENT_LBUTTONUP and selecting:
+        selecting = False
+        x1, y1, x2, y2 = selection_rect
+        if x1 > x2: x1, x2 = x2, x1
+        if y1 > y2: y1, y2 = y2, y1
+        x1 = max(0, x1); y1 = max(0, y1)
+        x2 = min(param['w'], x2); y2 = min(param['h'], y2)
+        selection_rect = (x1, y1, x2, y2)
+        waiting_select = True
+        if latest_frame is not None and x2 > x1 and y2 > y1:
+            region_detections = run_yolo_on_region(latest_frame, selection_rect)
+            region_detected = True
+            print(f"框选区域: ({x1},{y1})-({x2},{y2})，检测到 {len(region_detections)} 个目标")
+        else:
+            region_detections = []; region_detected = False
+        return
+
+    if event == cv2.EVENT_RBUTTONDOWN:
+        if waiting_select or selecting:
+            selecting = False; waiting_select = False; selection_rect = None
+            region_detections = []; region_detected = False; print("右键取消框选")
+        elif tracking_mode:
+            tracking_mode = False; tracking_bbox = None; lost_count = 0; dkf.reset(); kalman.reset(); track_start_frames = 0; print("右键取消跟踪")
+        return
+
+    if not selecting and not waiting_select:
+        if event == cv2.EVENT_LBUTTONDOWN:
+            mouse_data['active'] = True; mouse_data['last_move_time'] = time.time()
+            update_mouse_speed(x, y, param['w'], param['h'])
+        elif event == cv2.EVENT_MOUSEMOVE and mouse_data['active']:
+            mouse_data['last_move_time'] = time.time()
+            update_mouse_speed(x, y, param['w'], param['h'])
+        elif event == cv2.EVENT_LBUTTONUP:
+            mouse_data['active'] = False; mouse_data['yaw_speed'] = 0.0; mouse_data['pitch_speed'] = 0.0
+
+def update_mouse_speed(x, y, w, h):
+    yaw_speed = (x/w - 0.5)*300; pitch_speed = (0.5 - y/h)*300
+    mouse_data['yaw_speed'] = max(-100, min(100, yaw_speed))
+    mouse_data['pitch_speed'] = max(-100, min(100, pitch_speed))
+
+def match_target(current_detections, prev_bbox, is_first_frame=False):
+    """放宽匹配条件"""
+    tx, ty, tw, th = prev_bbox
+    prev_cx = tx + tw/2
+    prev_cy = ty + th/2
+    diag = (tw*tw + th*th)**0.5
+    if is_first_frame:
+        max_dist = diag * 4.0
+        iou_thresh = 0.0  # 第一帧不依赖 IoU
+    else:
+        max_dist = diag * 3.0
+        iou_thresh = 0.01
+
+    best_match = None
+    best_score = iou_thresh
+
+    for det in current_detections:
+        x1, y1, x2, y2, _, _ = det
+        cx = (x1+x2)/2
+        cy = (y1+y2)/2
+        dist = ((cx-prev_cx)**2 + (cy-prev_cy)**2)**0.5
+        if dist > max_dist:
+            continue
+        ix1 = max(x1, tx); iy1 = max(y1, ty)
+        ix2 = min(x2, tx+tw); iy2 = min(y2, ty+th)
+        inter = max(0, ix2-ix1) * max(0, iy2-iy1)
+        area1 = (x2-x1)*(y2-y1); area2 = tw*th
+        iou = inter / (area1 + area2 - inter + 1e-5)
+        dist_score = 1.0 - dist / max_dist if max_dist > 0 else 0
+        score = 0.5 * iou + 0.5 * dist_score
+        if score > best_score:
+            best_score = score
+            best_match = det
+    return best_match
+
+def main():
+    global MANUAL_SPEED_DEG_PER_SEC, latest_frame
+    global tracking_bbox, tracking_mode, smooth_fx, smooth_fy
+    global selecting, selection_rect, waiting_select, region_detections, region_detected, lost_count, track_start_frames
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    cap = cv2.VideoCapture(RTSP_URL)
+    if not cap.isOpened():
+        print("无法打开 RTSP 流"); return
+
+    ret, frame = cap.read()
+    if not ret:
+        print("无法读取视频帧"); return
+    h, w = frame.shape[:2]
+    latest_frame = frame.copy()
+
+    cv2.namedWindow("YOLO DKF Track")
+    cv2.setMouseCallback("YOLO DKF Track", mouse_callback, {'w': w, 'h': h})
+
+    target_yaw = 0.0; target_pitch = 0.0; last_control_t = time.time()
+    keys_down = set(); last_key_time = 0.0; manual_mode = False; last_manual_activity = 0.0
+
+    print("=" * 88)
+    print("YOLO 框选区域检测跟踪（修复立即丢失版）")
+    print("左键拖拽框选 → 区域YOLO检测 → 点击目标跟踪 | 双击/右键取消 | WASD/鼠标手动")
+    print("Q加速 E减速 | 空格回中/停止跟踪 | ESC退出")
+    print("跟踪阶段YOLO阈值降至0.25，匹配条件大幅放宽")
+    print("=" * 88)
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            time.sleep(0.1); continue
+        latest_frame = frame.copy()
+
+        cx, cy = w//2, h//2
+        now_t = time.time()
+
+        key = cv2.waitKey(1) & 0xFF
+        if key != 255:
+            if key == 27: break
+            elif key == ord(' '):
+                target_yaw = 0.0; target_pitch = 0.0
+                tracking_mode = False; tracking_bbox = None; lost_count = 0; track_start_frames = 0
+                dkf.reset(); kalman.reset()
+                waiting_select = False; selection_rect = None; region_detections = []; region_detected = False
+                print("回中并重置")
+            elif key == ord('q'):
+                MANUAL_SPEED_DEG_PER_SEC = min(150, MANUAL_SPEED_DEG_PER_SEC+10)
+                print(f"加速: {MANUAL_SPEED_DEG_PER_SEC:.0f}°/s")
+            elif key == ord('e'):
+                MANUAL_SPEED_DEG_PER_SEC = max(10, MANUAL_SPEED_DEG_PER_SEC-10)
+                print(f"减速: {MANUAL_SPEED_DEG_PER_SEC:.0f}°/s")
+            elif key in (ord('w'),ord('s'),ord('a'),ord('d')):
+                keys_down.add(key); last_key_time = now_t; manual_mode = True; last_manual_activity = now_t
+
+        if now_t - last_key_time > KEY_TIMEOUT: keys_down.clear()
+        if mouse_data['active']: manual_mode = True; last_manual_activity = now_t
+        if manual_mode and (now_t - last_manual_activity > MANUAL_IDLE_TIMEOUT):
+            manual_mode = False; print("恢复自动模式")
+
+        dt = now_t - last_control_t; dt = min(dt, DT_MAX)
+        if dt > 0:
+            if manual_mode:
+                dx, dy = 0, 0
+                if ord('w') in keys_down: dy = 1
+                if ord('s') in keys_down: dy = -1
+                if ord('a') in keys_down: dx = -1
+                if ord('d') in keys_down: dx = 1
+                if mouse_data['active']:
+                    dx += mouse_data['yaw_speed']/100.0
+                    dy += mouse_data['pitch_speed']/100.0
+                target_yaw += dx * MANUAL_SPEED_DEG_PER_SEC * dt
+                target_pitch += dy * MANUAL_SPEED_DEG_PER_SEC * dt
             else:
-                self.tracker = self._create_legacy_tracker(fallback.upper())
-                if self.tracker: self.active_method = fallback; return
-        self.active_method = 'none'
+                if tracking_mode and tracking_bbox is not None:
+                    # DKF 预测
+                    if dkf.initialized:
+                        dkf.predict(dt)
+                        kalman.predict(dt)
 
-    def init(self, frame, bbox):
-        if self.active_method == 'ssd': self.last_fast_bbox = bbox; return True
-        elif self.active_method == 'hybrid':
-            try:
-                self.fast_tracker.init(frame, bbox); self.accurate_tracker.init(frame, bbox)
-                self.last_fast_bbox = bbox; self.last_accurate_bbox = bbox; self.frame_count = 0; return True
-            except: return False
-        elif self.tracker:
-            try: self.tracker.init(frame, bbox); self.last_fast_bbox = bbox; return True
-            except: return False
-        return False
+                    # YOLO 检测（使用低阈值）
+                    original_conf = yolo.conf
+                    yolo.conf = 0.25  # 跟踪阶段降低阈值
+                    results = yolo(frame, verbose=False, imgsz=320)
+                    yolo.conf = original_conf
+                    dets = results[0].boxes
+                    current_dets = []
+                    if dets is not None:
+                        for box in dets:
+                            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+                            conf = box.conf.item(); cls_id = int(box.cls.item())
+                            current_dets.append((x1,y1,x2,y2,conf,cls_id))
 
-    def update(self, frame):
-        self.frame_count += 1
-        if self.active_method == 'ssd' and self.dnn_net:
-            h, w = frame.shape[:2]
-            blob = cv2.dnn.blobFromImage(cv2.resize(frame, (300, 300)), self.ssd_blob_params['scale'], (300, 300), self.ssd_blob_params['mean'])
-            self.dnn_net.setInput(blob); detections = self.dnn_net.forward()
-            valid_boxes = []
-            for i in range(detections.shape[2]):
-                if detections[0, 0, i, 2] > 0.5:
-                    box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
-                    (x, y, x1, y1) = box.astype("int"); valid_boxes.append((int(x), int(y), int(x1-x), int(y1-y)))
-            if not valid_boxes: return False, None
-            if self.last_fast_bbox:
-                best_iou, best_box = 0, None
-                for box in valid_boxes:
-                    iou = self._calculate_iou(self.last_fast_bbox, box)
-                    if iou > best_iou: best_iou = iou; best_box = box
-                if best_box and best_iou > 0.2: self.last_fast_bbox = best_box; return True, best_box
-            return False, None
+                    # 判断是否为跟踪初期（前5帧）
+                    is_first = track_start_frames < 5
+                    best_match = match_target(current_dets, tracking_bbox, is_first_frame=is_first)
 
-        if self.active_method == 'hybrid':
-            success_fast, bbox_fast = self.fast_tracker.update(frame)
-            if success_fast: self.last_fast_bbox = bbox_fast
-            if self.frame_count % self.calibrate_interval == 0:
-                success_acc, bbox_acc = self.accurate_tracker.update(frame)
-                if success_acc and bbox_acc:
-                    self.last_accurate_bbox = bbox_acc
-                    try: self.fast_tracker.init(frame, bbox_acc)
-                    except: pass
-            if self.last_accurate_bbox and self.frame_count % self.calibrate_interval == 0: return True, self.last_accurate_bbox
-            elif self.last_fast_bbox: return True, self.last_fast_bbox
-            else: return False, None
-
-        elif self.tracker:
-            try:
-                success, bbox = self.tracker.update(frame)
-                if success: self.last_fast_bbox = bbox
-                else: self.last_fast_bbox = None
-                return success, bbox
-            except: self.last_fast_bbox = None; return False, None
-        return False, None
-
-# ==================== 视频采集与跟踪线程（优化平滑系数） ====================
-class VideoAndTrackingThread(threading.Thread):
-    def __init__(self, rtsp_url):
-        super().__init__(daemon=True)
-        self.rtsp_url = rtsp_url
-        self.last_frame = None
-        self.last_frame_time = time.time()
-        self.running = True
-        self.connected = False
-        self.lock = threading.Lock()
-        
-        self.face_detector = FaceDetector(method=DEFAULT_DETECTOR)
-        self.object_tracker = ObjectTracker(method=DEFAULT_TRACKER)
-            
-        self.last_control_t = time.time()
-        self.tracking_mode = 'idle' 
-        self.roi_to_init = None
-        self.obj_lost_count = 0
-        self.smooth_fx = 0.0
-        self.smooth_fy = 0.0
-
-    def run(self):
-        frame_counter = 0
-        while self.running:
-            container = None
-            try:
-                logger.info(f"🚀 RTSP 连接中: {self.rtsp_url.split('@')[-1]}")
-                container = av.open(self.rtsp_url, options={
-                    'rtsp_transport': 'tcp', 'timeout': '3000000', 'stimeout': '3000000',
-                    'probesize': '153600', 'analyzeduration': '500000'
-                })
-                stream = container.streams.video[0]
-                stream.thread_type = 'AUTO'
-                self.connected = True
-                self.last_frame_time = time.time()
-                
-                for packet in container.demux(stream):
-                    if not self.running: break
-                    if packet.size == 0: continue
-                    for frame in packet.decode():
-                        if not self.running: break
-                        if not isinstance(frame, av.video.frame.VideoFrame): continue
-                        frame_counter += 1
-                        bgr_img = frame.to_ndarray(format='bgr24')
-                        if bgr_img.shape[1] != VIDEO_W or bgr_img.shape[0] != VIDEO_H:
-                            bgr_img = cv2.resize(bgr_img, (VIDEO_W, VIDEO_H))
-                        cx, cy = VIDEO_W // 2, VIDEO_H // 2
-                        now_t = time.time()
-                        
-                        with g_state.lock:
-                            is_manual = g_state.manual_mode
-                            if g_state.roi_request is not None:
-                                self.roi_to_init = g_state.roi_request
-                                g_state.roi_request = None
-
-                        if is_manual:
-                            cv2.putText(bgr_img, "MODE: MANUAL CONTROL", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                    if best_match is not None:
+                        lost_count = 0
+                        track_start_frames = 0  # 匹配成功后退出特殊模式
+                        x1,y1,x2,y2,_,_ = best_match
+                        if dkf.initialized:
+                            cx_m = (x1+x2)/2.0
+                            cy_m = (y1+y2)/2.0
+                            w_m = x2-x1
+                            h_m = y2-y1
+                            dkf.update((cx_m, cy_m, w_m, h_m), dt)
+                            kalman.update(cx_m, cy_m, dt)
+                            smoothed = dkf.get_bbox()
+                            if smoothed:
+                                x1, y1, x2, y2 = smoothed
+                                x1 = int(x1); y1 = int(y1); x2 = int(x2); y2 = int(y2)
+                        tracking_bbox = (x1, y1, x2-x1, y2-y1)
+                        fx_raw, fy_raw = (x1+x2)//2, (y1+y2)//2
+                        smooth_fx = SMOOTH_ALPHA*fx_raw + (1-SMOOTH_ALPHA)*smooth_fx
+                        smooth_fy = SMOOTH_ALPHA*fy_raw + (1-SMOOTH_ALPHA)*smooth_fy
+                        fx, fy = int(smooth_fx), int(smooth_fy)
+                        predicted = kalman.predict_future(PREDICT_AHEAD_MS / 1000.0)
+                        if predicted:
+                            px, py = predicted
                         else:
-                            if self.roi_to_init is not None:
-                                rx, ry, rw, rh = self.roi_to_init
-                                bbox = (int(rx*VIDEO_W), int(ry*VIDEO_H), int(rw*VIDEO_W), int(rh*VIDEO_H))
-                                bbox = (max(0, bbox[0]), max(0, bbox[1]), min(bbox[2], VIDEO_W-bbox[0]), min(bbox[3], VIDEO_H-bbox[1]))
-                                if bbox[2] > 10 and bbox[3] > 10:
-                                    roi_img = bgr_img[bbox[1]:bbox[1]+bbox[3], bbox[0]:bbox[0]+bbox[2]]
-                                    faces_in_roi = self.face_detector.detect(roi_img)
-                                    if len(faces_in_roi) > 0:
-                                        self.tracking_mode = 'face'
-                                        with g_state.lock: g_state.tracking_mode = 'face'
-                                        logger.info(f"👤 框选区域检测到人脸，切入【人脸跟踪模式】")
+                            px, py = fx, fy
+                        dx = px - cx; dy = py - cy
+                        if abs(dx) > DEADZONE_PX: target_yaw += dx*K_PX_TO_DEG*dt
+                        if abs(dy) > DEADZONE_PX: target_pitch -= dy*K_PX_TO_DEG*dt
+                        cv2.rectangle(frame,(x1,y1),(x2,y2),(0,255,255),2)
+                        cv2.circle(frame,(int(px),int(py)),4,(0,0,255),-1)
+                        cv2.putText(frame,"TRACKING+DKF",(10,30),cv2.FONT_HERSHEY_SIMPLEX,0.7,(0,255,255),2)
+                    else:
+                        lost_count += 1
+                        if lost_count >= MAX_LOST_FRAMES:
+                            tracking_mode = False; tracking_bbox = None; lost_count = 0; track_start_frames = 0
+                            dkf.reset(); kalman.reset()
+                            print(f"跟踪丢失（连续{MAX_LOST_FRAMES}帧无匹配）")
+                            cv2.putText(frame,"LOST",(10,30),cv2.FONT_HERSHEY_SIMPLEX,0.7,(0,0,255),2)
+                        else:
+                            if dkf.initialized:
+                                predicted_bbox = dkf.get_bbox()
+                                if predicted_bbox:
+                                    x1, y1, x2, y2 = predicted_bbox
+                                    x1 = int(x1); y1 = int(y1); x2 = int(x2); y2 = int(y2)
+                                    tracking_bbox = (x1, y1, x2-x1, y2-y1)
+                                    fx_raw, fy_raw = (x1+x2)//2, (y1+y2)//2
+                                    smooth_fx = SMOOTH_ALPHA*fx_raw + (1-SMOOTH_ALPHA)*smooth_fx
+                                    smooth_fy = SMOOTH_ALPHA*fy_raw + (1-SMOOTH_ALPHA)*smooth_fy
+                                    fx, fy = int(smooth_fx), int(smooth_fy)
+                                    predicted = kalman.predict_future(PREDICT_AHEAD_MS / 1000.0)
+                                    if predicted:
+                                        px, py = predicted
                                     else:
-                                        if self.object_tracker.init(bgr_img, bbox):
-                                            self.obj_lost_count = 0
-                                            self.smooth_fx = bbox[0] + bbox[2] // 2
-                                            self.smooth_fy = bbox[1] + bbox[3] // 2
-                                            self.tracking_mode = 'object'
-                                            with g_state.lock: g_state.tracking_mode = 'object'
-                                            logger.info(f"🎯 切入【物体跟踪模式】")
-                                        else:
-                                            self.tracking_mode = 'idle'
-                                            with g_state.lock: g_state.tracking_mode = 'idle'
-                                self.roi_to_init = None
-
-                            if self.tracking_mode == 'idle':
-                                cv2.line(bgr_img, (cx - 20, cy), (cx + 20, cy), (255, 255, 255), 1)
-                                cv2.line(bgr_img, (cx, cy - 20), (cx, cy + 20), (255, 255, 255), 1)
-                                cv2.putText(bgr_img, "MODE: IDLE", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (128, 128, 128), 2)
-                                
-                            elif self.tracking_mode == 'object':
-                                success, bbox = self.object_tracker.update(bgr_img)
-                                cv2.line(bgr_img, (cx - 20, cy), (cx + 20, cy), (255, 255, 255), 1)
-                                cv2.line(bgr_img, (cx, cy - 20), (cx, cy + 20), (255, 255, 255), 1)
-                                if success and bbox is not None:
-                                    self.obj_lost_count = 0
-                                    px, py, pw, ph = [int(v) for v in bbox]
-                                    fx_raw, fy_raw = px + pw // 2, py + ph // 2
-                                    # 【优化】平滑系数从0.7改为0.5，降低滞后
-                                    self.smooth_fx = 0.5 * fx_raw + 0.5 * self.smooth_fx
-                                    self.smooth_fy = 0.5 * fy_raw + 0.5 * self.smooth_fy
-                                    fx, fy = int(self.smooth_fx), int(self.smooth_fy)
-                                    dx, dy = fx - cx, fy - cy
-                                    dt = now_t - self.last_control_t
-                                    dt = min(dt, 0.15)  # 放宽上限
-                                    if dt > 0:
-                                        with g_state.lock:
-                                            g_state.manual_mode = False
-                                            if abs(dx) > DEADZONE_PX:
-                                                g_state.target_yaw += dx * K_PX_TO_DEG * dt
-                                            if abs(dy) > DEADZONE_PX:
-                                                g_state.target_pitch += -dy * K_PX_TO_DEG * dt
-                                            g_state.target_yaw = max(-135.0, min(135.0, g_state.target_yaw))
-                                            # pitch 不限幅
-                                        self.last_control_t = now_t
-                                    cv2.rectangle(bgr_img, (px, py), (px + pw, py + ph), (255, 100, 0), 2)
-                                    cv2.circle(bgr_img, (fx, fy), 4, (0, 0, 255), -1)
-                                    cv2.putText(bgr_img, f"OBJ POS MODE", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 100, 0), 2)
+                                        px, py = fx, fy
+                                    dx = px - cx; dy = py - cy
+                                    if abs(dx) > DEADZONE_PX: target_yaw += dx*K_PX_TO_DEG*dt
+                                    if abs(dy) > DEADZONE_PX: target_pitch -= dy*K_PX_TO_DEG*dt
+                                    cv2.rectangle(frame,(x1,y1),(x2,y2),(0,255,255),1)
+                                    cv2.circle(frame,(int(px),int(py)),4,(0,0,255),-1)
+                                    cv2.putText(frame,f"PREDICT ({lost_count}/{MAX_LOST_FRAMES})",(10,30),cv2.FONT_HERSHEY_SIMPLEX,0.7,(0,255,255),2)
                                 else:
-                                    self.obj_lost_count += 1
-                                    cv2.putText(bgr_img, f"LOST ({self.obj_lost_count}/15)", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-                                    if self.obj_lost_count > 15:
-                                        self.tracking_mode = 'idle'
-                                        with g_state.lock: g_state.tracking_mode = 'idle'
-                                        
-                            elif self.tracking_mode == 'face':
-                                if frame_counter % 2 == 0:
-                                    faces = self.face_detector.detect(bgr_img)
-                                has_face = len(faces) > 0
-                                cv2.line(bgr_img, (cx - 20, cy), (cx + 20, cy), (255, 255, 255), 1)
-                                cv2.line(bgr_img, (cx, cy - 20), (cx, cy + 20), (255, 255, 255), 1)
-                                if has_face:
-                                    largest_face = max(faces, key=lambda f: f[2] * f[3])
-                                    x, y, ww, hh = largest_face
-                                    fx, fy = x + ww // 2, y + hh // 2
-                                    dx, dy = fx - cx, fy - cy
-                                    dt = now_t - self.last_control_t
-                                    dt = min(dt, 0.15)
-                                    if dt > 0:
-                                        with g_state.lock:
-                                            g_state.manual_mode = False
-                                            if abs(dx) > DEADZONE_PX:
-                                                g_state.target_yaw += dx * K_PX_TO_DEG * dt
-                                            if abs(dy) > DEADZONE_PX:
-                                                g_state.target_pitch += -dy * K_PX_TO_DEG * dt
-                                            g_state.target_yaw = max(-135.0, min(135.0, g_state.target_yaw))
-                                        self.last_control_t = now_t
-                                    cv2.rectangle(bgr_img, (x, y), (x + ww, y + hh), (0, 255, 0), 2)
-                                    cv2.circle(bgr_img, (fx, fy), 4, (0, 0, 255), -1)
-                                    cv2.putText(bgr_img, f"FACE POS MODE", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                                else:
-                                    cv2.putText(bgr_img, "SEARCHING...", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-                        
-                        with g_state.lock:
-                            osd_text = f"Target: Y={g_state.target_yaw:+5.1f} P={g_state.target_pitch:+5.1f}"
-                        cv2.putText(bgr_img, osd_text, (15, VIDEO_H - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-                        _, buf = cv2.imencode('.jpg', bgr_img, [int(cv2.IMWRITE_JPEG_QUALITY), 48])  # 略提高质量
-                        with self.lock:
-                            self.last_frame = buf.tobytes()
-                            self.last_frame_time = time.time()
-            except Exception as e:
-                logger.error(f"❌ 视频线程异常: {e}")
-                self.connected = False
-            finally:
-                if container:
-                    try: container.close()
-                    except: pass
-                if self.running: time.sleep(1)
+                                    x,y,bw,bh = tracking_bbox
+                                    cv2.rectangle(frame,(x,y),(x+bw,y+bh),(0,255,255),1)
+                                    cv2.putText(frame,f"HOLD ({lost_count}/{MAX_LOST_FRAMES})",(10,30),cv2.FONT_HERSHEY_SIMPLEX,0.7,(0,255,255),2)
+                            else:
+                                x,y,bw,bh = tracking_bbox
+                                cv2.rectangle(frame,(x,y),(x+bw,y+bh),(0,255,255),1)
+                                cv2.putText(frame,f"HOLD ({lost_count}/{MAX_LOST_FRAMES})",(10,30),cv2.FONT_HERSHEY_SIMPLEX,0.7,(0,255,255),2)
 
-    def get_latest_frame(self):
-        if time.time() - self.last_frame_time > 4.0: self.connected = False
-        with self.lock: return self.last_frame
-
-    def stop(self): self.running = False
-
-video_thread = VideoAndTrackingThread(RTSP_URL)
-video_thread.start()
-
-# 启动 30Hz 发送线程
-threading.Thread(target=send_loop, daemon=True).start()
-
-# ==================== 后端路由与 API（不变） ====================
-async def gimbal_watchdog_ctx(app):
-    logger.info("🕵️ 智能混合看门狗就绪")
-    async def watchdog_loop():
-        try:
-            while True:
-                await asyncio.sleep(0.05)
-                now = time.time()
-                with g_state.lock:
-                    if g_state.manual_mode and now - g_state.last_manual_time > 0.35:
-                        g_state.manual_mode = False
-                        g_state.manual_yaw = 0; g_state.manual_pitch = 0
-        except asyncio.CancelledError: pass
-    task = asyncio.create_task(watchdog_loop())
-    yield
-    task.cancel()
-    await task
-
-async def handle_gimbal_control(request):
-    try:
-        data = await request.json()
-        yaw = int(data.get('yaw', 0)); pitch = int(data.get('pitch', 0))
-        with g_state.lock:
-            g_state.last_manual_time = time.time()
-            g_state.manual_mode = True
-            g_state.manual_yaw = yaw; g_state.manual_pitch = pitch
-        return web.json_response({'status': 'success'})
-    except Exception as e:
-        return web.json_response({'status': 'error', 'reason': str(e)}, status=500)
-
-async def handle_tracker_init(request):
-    try:
-        data = await request.json()
-        x = float(data.get('x', 0)); y = float(data.get('y', 0))
-        w = float(data.get('width', 0)); h = float(data.get('height', 0))
-        with g_state.lock:
-            g_state.roi_request = (x, y, w, h)
-        return web.json_response({'status': 'success'})
-    except Exception as e:
-        return web.json_response({'status': 'error', 'reason': str(e)}, status=500)
-
-async def handle_tracker_reset(request):
-    with g_state.lock:
-        g_state.tracking_mode = 'idle'
-        g_state.roi_request = None
-    video_thread.tracking_mode = 'idle'
-    video_thread.roi_to_init = None
-    return web.json_response({'status': 'success'})
-
-async def handle_detector_switch(request):
-    try:
-        data = await request.json()
-        method = data.get('method', 'haar')
-        if method not in ['haar', 'lbp', 'dnn']:
-            return web.json_response({'status': 'error', 'reason': 'Invalid method.'}, status=400)
-        video_thread.face_detector._load(method)
-        return web.json_response({'status': 'success', 'active_method': video_thread.face_detector.active_method})
-    except Exception as e:
-        return web.json_response({'status': 'error', 'reason': str(e)}, status=500)
-
-async def handle_tracker_switch(request):
-    try:
-        data = await request.json()
-        method = data.get('method', 'hybrid')
-        if method not in ['hybrid', 'mosse', 'kcf', 'csrt', 'dasiamrpn', 'ssd']:
-            return web.json_response({'status': 'error', 'reason': 'Invalid method.'}, status=400)
-        video_thread.object_tracker._load(method)
-        return web.json_response({'status': 'success', 'active_method': video_thread.object_tracker.active_method})
-    except Exception as e:
-        return web.json_response({'status': 'error', 'reason': str(e)}, status=500)
-
-async def handle_status(request):
-    with g_state.lock:
-        tgt_y = g_state.target_yaw
-        tgt_p = g_state.target_pitch
-    return web.json_response({
-        'rtsp_connected': video_thread.connected, 
-        'system_mode': 'manual' if g_state.manual_mode else 'auto',
-        'tracking_mode': g_state.tracking_mode,
-        'detector_type': video_thread.face_detector.active_method,
-        'tracker_type': video_thread.object_tracker.active_method,
-        'target_yaw': round(tgt_y, 2),
-        'target_pitch': round(tgt_p, 2)
-    })
-
-async def handle_static(request):
-    path = request.match_info.get('path', 'index.html') or 'index.html'
-    file_path = os.path.join(WORKSPACE_DIR, path)
-    if os.path.exists(file_path): return web.FileResponse(file_path)
-    return web.Response(status=404)
-
-async def websocket_handler(request):
-    ws = web.WebSocketResponse()
-    await ws.prepare(request)
-    last_sent_frame_time = 0
-    try:
-        while not ws.closed:
-            current_frame = video_thread.get_latest_frame()
-            current_frame_time = video_thread.last_frame_time
-            if current_frame and current_frame_time > last_sent_frame_time:
-                now = time.time()
-                if now - last_sent_frame_time >= MIN_FRAME_INTERVAL:
-                    try:
-                        await ws.send_bytes(current_frame)
-                        last_sent_frame_time = now
-                    except: break
+                    track_start_frames += 1
                 else:
-                    await asyncio.sleep(MIN_FRAME_INTERVAL - (now - last_sent_frame_time))
-            else:
-                await asyncio.sleep(0.01)
-    finally:
-        return ws
+                    if waiting_select and selection_rect is not None and region_detected:
+                        x1,y1,x2,y2 = selection_rect
+                        cv2.rectangle(frame,(x1,y1),(x2,y2),(0,165,255),2)
+                        for det in region_detections:
+                            dx1,dy1,dx2,dy2,conf,cls_id = det
+                            cv2.rectangle(frame,(dx1,dy1),(dx2,dy2),(0,255,0),2)
+                            name = yolo.model.names.get(cls_id,str(cls_id))
+                            cv2.putText(frame,f"{name} {conf:.2f}",(dx1,dy1-10),cv2.FONT_HERSHEY_SIMPLEX,0.5,(0,255,0),2)
+                        cv2.putText(frame,"SELECT - Click a green box to track",(10,30),cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,165,255),2)
+                    else:
+                        cv2.putText(frame,"IDLE - Drag to select region",(10,30),cv2.FONT_HERSHEY_SIMPLEX,0.6,(128,128,128),2)
 
-async def init_app():
-    app = web.Application()
-    app.router.add_get('/api/ws', websocket_handler)
-    app.router.add_post('/api/gimbal/control', handle_gimbal_control)
-    app.router.add_post('/api/tracker/init', handle_tracker_init)
-    app.router.add_post('/api/tracker/reset', handle_tracker_reset)
-    app.router.add_post('/api/detector/switch', handle_detector_switch)
-    app.router.add_post('/api/tracker/switch', handle_tracker_switch)
-    app.router.add_get('/api/status', handle_status)
-    app.router.add_get('/{path:.*}', handle_static)
-    app.cleanup_ctx.append(gimbal_watchdog_ctx)
-    return app
+            if selecting and selection_rect is not None:
+                x1,y1,x2,y2 = selection_rect
+                cv2.rectangle(frame,(x1,y1),(x2,y2),(255,0,0),2)
+
+            target_yaw = max(-135.0,min(135.0,target_yaw))
+            target_pitch = max(-90.0,min(90.0,target_pitch))
+            last_control_t = now_t
+
+        cmd = build_position_cmd(target_yaw,target_pitch,reverse_pitch=REVERSE_PITCH)
+        sock.sendto(cmd,(CAMERA_IP,UDP_PORT))
+
+        mode_str = "MANUAL" if manual_mode else ("TRACK" if tracking_mode else "IDLE")
+        info = f"Mode:{mode_str} Yaw:{target_yaw:+6.1f} Pitch:{target_pitch:+6.1f}"
+        cv2.putText(frame,info,(10,h-20),cv2.FONT_HERSHEY_SIMPLEX,0.5,(0,255,255),1)
+        cv2.imshow("YOLO DKF Track",frame)
+
+    cap.release(); cv2.destroyAllWindows(); sock.close()
 
 if __name__ == '__main__':
-    try:
-        app = asyncio.get_event_loop().run_until_complete(init_app())
-        web.run_app(app, host='0.0.0.0', port=SERVER_PORT)
-    except KeyboardInterrupt: pass
-    finally:
-        video_thread.stop()
-        g_udp_socket.close()
+    main()
