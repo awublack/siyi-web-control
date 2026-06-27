@@ -226,7 +226,7 @@ class YoloDetector:
         self.model = None
         self.model_name = model_name
         self.active = False
-        self detections = []  # 当前检测结果
+        self.detections = []  # 当前检测结果
         if YOLO_AVAILABLE:
             self._load(model_name)
     
