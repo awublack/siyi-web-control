@@ -3,536 +3,522 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>SIYI A8 Mini - YOLO 智能跟踪系统</title>
+    <title>SIYI 云台测试工具</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: 'Segoe UI', system-ui, sans-serif; background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); min-height: 100vh; color: #fff; padding: 20px; }
-        .container { max-width: 1200px; margin: 0 auto; }
+        .container { max-width: 1400px; margin: 0 auto; }
         h1 { text-align: center; margin-bottom: 30px; color: #00d9ff; text-shadow: 0 0 20px rgba(0, 217, 255, 0.5); }
-        .main-grid { display: grid; grid-template-columns: 1fr 350px; gap: 20px; }
-        .video-section, .control-panel { background: rgba(255, 255, 255, 0.05); border-radius: 15px; padding: 20px; backdrop-filter: blur(10px); }
-        .video-container { position: relative; width: 100%; aspect-ratio: 4/3; background: #000; border-radius: 10px; overflow: hidden; display: flex; align-items: center; justify-content: center; }
-        #videoStream { width: 100%; height: 100%; object-fit: contain; display: none; user-select: none; }
-        #interactionCanvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 10; }
-        .status-overlay { position: absolute; text-align: center; padding: 20px; z-index: 5; }
-        .status-overlay h2 { font-size: 24px; margin-bottom: 10px; color: #00d9ff; }
-        .status-item { margin: 10px 0; font-size: 16px; }
-        .status-card { background: rgba(0, 0, 0, 0.3); border-radius: 10px; padding: 15px; margin-bottom: 15px; border-left: 4px solid #00d9ff; }
-        .status-item-row { display: flex; justify-content: space-between; margin-bottom: 8px; font-size: 14px; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; }
+        .card { background: rgba(255, 255, 255, 0.05); border-radius: 15px; padding: 20px; backdrop-filter: blur(10px); border: 1px solid rgba(255, 255, 255, 0.1); }
+        .card h2 { color: #00d9ff; margin-bottom: 15px; font-size: 18px; border-bottom: 1px solid rgba(0, 217, 255, 0.3); padding-bottom: 10px; }
+        .btn { padding: 10px 15px; border: none; border-radius: 8px; cursor: pointer; font-weight: bold; font-size: 13px; margin: 3px; transition: all 0.2s; }
+        .btn-primary { background: linear-gradient(135deg, #00d9ff, #0077b6); color: #fff; }
+        .btn-success { background: linear-gradient(135deg, #51cf66, #37b24d); color: #fff; }
+        .btn-danger { background: linear-gradient(135deg, #ff6b6b, #ee5a5a); color: #fff; }
+        .btn-warning { background: linear-gradient(135deg, #ffd43b, #f08c00); color: #000; }
+        .btn:hover { transform: translateY(-2px); box-shadow: 0 5px 15px rgba(0, 0, 0, 0.3); }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        .input-group { margin: 10px 0; }
+        .input-group label { display: block; margin-bottom: 5px; font-size: 12px; color: #aaa; }
+        .input-group input, .input-group select { width: 100%; padding: 8px; border-radius: 6px; border: 1px solid rgba(255, 255, 255, 0.2); background: rgba(0, 0, 0, 0.3); color: #fff; }
+        .status-item { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid rgba(255, 255, 255, 0.1); }
         .status-label { color: #aaa; }
         .status-value { font-weight: bold; color: #00d9ff; }
-        .mode-indicator { padding: 12px 15px; border-radius: 8px; text-align: center; font-weight: bold; margin-bottom: 15px; transition: all 0.3s ease; font-size: 16px; }
-        .mode-auto { background: linear-gradient(135deg, #00b894, #00cec9); }
-        .mode-manual { background: linear-gradient(135deg, #fd79a8, #e84393); animation: pulse-manual 1s infinite alternate; }
-        .mode-idle { background: linear-gradient(135deg, #636e72, #2d3436); }
-        .mode-yolo { background: linear-gradient(135deg, #00ff88, #00cc6a); animation: pulse-yolo 1.5s infinite alternate; }
-        @keyframes pulse-manual { 0% { box-shadow: 0 0 5px #e84393; } 100% { box-shadow: 0 0 15px #e84393; } }
-        @keyframes pulse-yolo { 0% { box-shadow: 0 0 10px #00ff88; } 100% { box-shadow: 0 0 25px #00ff88; } }
-        .control-buttons { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin-bottom: 15px; }
-        .btn { padding: 14px 20px; border: none; border-radius: 8px; cursor: pointer; font-weight: bold; font-size: 14px; transition: all 0.2s ease; }
-        .btn-primary { background: linear-gradient(135deg, #00d9ff, #0077b6); color: #fff; }
-        .btn-danger { background: linear-gradient(135deg, #ff6b6b, #ee5a5a); color: #fff; }
-        .btn-success { background: linear-gradient(135deg, #51cf66, #37b24d); color: #fff; }
-        .btn-warning { background: linear-gradient(135deg, #f59f00, #f08c00); color: #fff; }
-        .btn-info { background: linear-gradient(135deg, #228be6, #1864ab); color: #fff; }
-        .btn-active-hunting { animation: pulse-glow 1.5s infinite alternate; border: 2px solid #fff; }
-        @keyframes pulse-glow { 0% { box-shadow: 0 0 5px #00ff88; } 100% { box-shadow: 0 0 20px #00ff88; } }
-        .btn:hover { transform: translateY(-2px); box-shadow: 0 5px 15px rgba(0, 0, 0, 0.3); }
-        .btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
-        .keyboard-help { background: rgba(0, 0, 0, 0.3); border-radius: 10px; padding: 15px; margin-top: 15px; }
-        .keyboard-help h3 { margin-bottom: 10px; color: #00d9ff; font-size: 14px; }
-        .key-row { display: flex; justify-content: space-between; padding: 6px 0; font-size: 13px; border-bottom: 1px solid rgba(255, 255, 255, 0.1); }
-        .key-row:last-child { border-bottom: none; }
-        .key { background: rgba(255, 255, 255, 0.15); padding: 3px 10px; border-radius: 4px; font-family: monospace; }
-        .log-container { background: rgba(0, 0, 0, 0.5); border-radius: 8px; padding: 10px; height: 150px; overflow-y: auto; font-family: monospace; font-size: 11px; margin-top: 15px; }
-        .log-entry { margin-bottom: 3px; }
-        .log-info { color: #00d9ff; } .log-success { color: #51cf66; } .log-warning { color: #ffd43b; } .log-error { color: #ff6b6b; }
-        .setting-item { margin-bottom: 12px; }
-        .setting-label { display: block; margin-bottom: 5px; font-size: 12px; color: #aaa; }
-        .setting-input { 
-            width: 100%; padding: 8px 10px; border: 1px solid rgba(255, 255, 255, 0.2); border-radius: 6px; 
-            background: rgba(0, 0, 0, 0.3); color: #fff; appearance: none; -webkit-appearance: none;
-            background-image: url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2300d9ff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3e%3cpolyline points='6 9 12 15 18 9'%3e%3c/polyline%3e%3c/svg%3e");
-            background-repeat: no-repeat; background-position: right 10px center; background-size: 16px; padding-right: 30px;
-        }
-        .setting-input option { background: #16213e; color: #fff; }
-        .connection-status { padding: 10px; border-radius: 8px; margin-bottom: 15px; text-align: center; font-weight: bold; }
+        .log-box { background: rgba(0, 0, 0, 0.5); border-radius: 8px; padding: 10px; height: 200px; overflow-y: auto; font-family: monospace; font-size: 11px; }
+        .log-info { color: #00d9ff; }
+        .log-success { color: #51cf66; }
+        .log-warning { color: #ffd43b; }
+        .log-error { color: #ff6b6b; }
+        .connection-status { padding: 10px; border-radius: 8px; text-align: center; font-weight: bold; margin-bottom: 15px; }
         .conn-ok { background: rgba(81, 207, 102, 0.2); border: 1px solid #51cf66; color: #51cf66; }
         .conn-error { background: rgba(255, 107, 107, 0.2); border: 1px solid #ff6b6b; color: #ff6b6b; }
-        
-        /* 目标选择提示 */
-        .target-hint { position: absolute; top: 10px; right: 10px; background: rgba(0, 0, 0, 0.7); padding: 10px 15px; border-radius: 8px; z-index: 20; display: none; }
-        .target-hint.show { display: block; animation: slide-in 0.3s ease; }
-        @keyframes slide-in { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
-        
-        .context-menu { position: absolute; background: rgba(0, 0, 0, 0.9); border: 1px solid #00d9ff; border-radius: 8px; padding: 10px; z-index: 100; display: none; }
-        .context-menu-item { padding: 8px 15px; cursor: pointer; color: #fff; border-radius: 4px; margin-bottom: 5px; }
-        .context-menu-item:hover { background: rgba(0, 217, 255, 0.2); }
-        .context-menu-item:last-child { margin-bottom: 0; }
-        
-        @media (max-width: 900px) { .main-grid { grid-template-columns: 1fr; } }
+        .video-container { position: relative; width: 100%; aspect-ratio: 16/9; background: #000; border-radius: 10px; overflow: hidden; }
+        .video-container video, .video-container canvas { width: 100%; height: 100%; }
+        .joystick-area { position: relative; width: 200px; height: 200px; margin: 0 auto; background: rgba(0, 0, 0, 0.3); border-radius: 50%; border: 2px solid rgba(0, 217, 255, 0.3); }
+        .joystick-knob { position: absolute; width: 50px; height: 50px; background: radial-gradient(circle, #00d9ff, #0077b6); border-radius: 50%; top: 50%; left: 50%; transform: translate(-50%, -50%); cursor: pointer; }
+        .mode-indicator { padding: 8px; border-radius: 6px; text-align: center; font-weight: bold; margin: 10px 0; }
+        .mode-lock { background: rgba(81, 207, 102, 0.3); color: #51cf66; }
+        .mode-follow { background: rgba(0, 217, 255, 0.3); color: #00d9ff; }
+        .mode-fpv { background: rgba(255, 212, 59, 0.3); color: #ffd43b; }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>🎯 SIYI A8 Mini - YOLO 智能跟踪系统</h1>
-        <div class="main-grid">
-            <div class="video-section">
-                <div class="video-container" id="videoContainer">
-                    <img id="videoStream" alt="Video Stream">
-                    <canvas id="interactionCanvas"></canvas>
-                    <div class="status-overlay" id="videoOverlay">
-                        <h2>📡 控制系统就绪</h2>
-                        <div class="status-item">状态：<span class="status-value" id="mainStatus">等待启动...</span></div>
-                    </div>
-                    <div class="target-hint" id="targetHint">
-                        <div style="color: #00ff88; font-weight: bold; margin-bottom: 5px;">🎯 选择目标</div>
-                        <div style="font-size: 12px;">左键单击：选择目标</div>
-                        <div style="font-size: 12px;">右键单击：取消跟踪</div>
-                    </div>
+        <h1>🎯 SIYI 云台测试工具 - 完整功能覆盖</h1>
+        
+        <div class="connection-status conn-error" id="connStatus">🔴 未连接</div>
+        
+        <div class="grid">
+            <!-- 连接控制 -->
+            <div class="card">
+                <h2>📡 连接控制</h2>
+                <div class="input-group">
+                    <label>相机 IP</label>
+                    <input type="text" id="cameraIp" value="192.168.144.25" readonly>
                 </div>
-                <div class="log-container" id="logContainer"></div>
+                <button class="btn btn-success" onclick="connect()" id="btnConnect">▶ 连接</button>
+                <button class="btn btn-danger" onclick="disconnect()" id="btnDisconnect" disabled>⏹ 断开</button>
+                <div style="margin-top: 15px;">
+                    <div class="status-item"><span class="status-label">硬件 ID</span><span class="status-value" id="hwId">-</span></div>
+                    <div class="status-item"><span class="status-label">固件版本</span><span class="status-value" id="fwVer">-</span></div>
+                </div>
             </div>
-            
-            <div class="control-panel">
-                <div class="connection-status conn-error" id="connStatus">🔴 未连接</div>
-                <div class="mode-indicator mode-idle" id="modeIndicator">⏸️ 待机中 (请点击目标)</div>
-                
-                <div class="status-card">
-                    <div class="status-item-row"><span class="status-label">云台 Yaw</span><span class="status-value" id="statusYaw">0</span></div>
-                    <div class="status-item-row"><span class="status-label">云台 Pitch</span><span class="status-value" id="statusPitch">0</span></div>
-                    <div class="status-item-row"><span class="status-label">检测器</span><span class="status-value" id="currentDetector" style="color:#ffd43b">-</span></div>
-                    <div class="status-item-row"><span class="status-label">跟踪器</span><span class="status-value" id="currentTracker" style="color:#ff7f50">-</span></div>
-                    <div class="status-item-row"><span class="status-label">目标类别</span><span class="status-value" id="targetClass" style="color:#00ff88">-</span></div>
-                    <div class="status-item-row"><span class="status-label">点击 X</span><span class="status-value" id="clickX" style="color:#00ff88">-</span></div>
-                    <div class="status-item-row"><span class="status-label">点击 Y</span><span class="status-value" id="clickY" style="color:#00ff88">-</span></div>
+
+            <!-- 状态显示 -->
+            <div class="card">
+                <h2>📊 实时状态</h2>
+                <div class="status-item"><span class="status-label">Yaw</span><span class="status-value" id="yaw">0.0°</span></div>
+                <div class="status-item"><span class="status-label">Pitch</span><span class="status-value" id="pitch">0.0°</span></div>
+                <div class="status-item"><span class="status-label">Roll</span><span class="status-value" id="roll">0.0°</span></div>
+                <div class="status-item"><span class="status-label">变焦倍率</span><span class="status-value" id="zoom">1.0x</span></div>
+                <div class="status-item"><span class="status-label">温度</span><span class="status-value" id="temp">--°C</span></div>
+                <div class="status-item"><span class="status-label">录像</span><span class="status-value" id="recState">停止</span></div>
+                <div id="modeIndicator" class="mode-indicator mode-lock">🔒 锁定模式</div>
+            </div>
+
+            <!-- 云台控制 -->
+            <div class="card">
+                <h2>🎮 云台控制</h2>
+                <div class="joystick-area" id="joystick">
+                    <div class="joystick-knob" id="joystickKnob"></div>
                 </div>
-                
-                <div class="control-buttons">
-                    <button class="btn btn-success" id="btnStart" onclick="startService()">▶ 启动服务</button>
-                    <button class="btn btn-primary" onclick="centerGimbal()">🎯 云台回中</button>
-                    <button class="btn btn-info" id="btnSelectionMode" onclick="toggleSelectionMode()" disabled>👆 选择模式：关</button>
-                    <button class="btn btn-warning" onclick="resetTracking()">🔄 重置跟踪</button>
-                    <button class="btn btn-danger" id="btnStop" onclick="stopService()" disabled style="grid-column: span 2;">⏹ 停止服务</button>
+                <div style="text-align: center; margin-top: 10px; font-size: 11px; color: #aaa;">拖拽摇杆控制云台</div>
+                <div style="margin-top: 15px;">
+                    <button class="btn btn-primary" onclick="centerGimbal()">🎯 回中</button>
+                    <button class="btn btn-warning" onclick="resetGimbal()">🔄 重置</button>
                 </div>
-                
-                <div class="setting-item">
-                    <label class="setting-label">摄像头 IP (仅作显示参考)</label>
-                    <input type="text" class="setting-input" id="cameraIp" value="192.168.144.25" readonly>
-                </div>
-                
-                <div class="setting-item">
-                    <label class="setting-label">检测算法</label>
-                    <select class="setting-input" id="detectorSelect" onchange="switchDetector()">
-                        <option value="yolo" selected>YOLOv8 (智能识别/推荐)</option>
-                        <option value="haar">Haar Cascade (极速)</option>
-                        <option value="lbp">LBP Cascade (抗光照)</option>
-                        <option value="dnn">DNN YuNet (人脸高精度)</option>
-                    </select>
-                </div>
-                
-                <div class="setting-item">
-                    <label class="setting-label">跟踪算法</label>
-                    <select class="setting-input" id="trackerSelect" onchange="switchTracker()">
-                        <option value="hybrid" selected>Hybrid (MOSSE+CSRT 融合)</option>
-                        <option value="mosse">MOSSE (极速)</option>
-                        <option value="kcf">KCF (平衡)</option>
-                        <option value="csrt">CSRT (高精度)</option>
-                        <option value="dasiamrpn">DaSiamRPN (深度学习)</option>
-                    </select>
-                </div>
-                
-                <div class="keyboard-help">
-                    <h3>⌨️ 键盘与鼠标控制</h3>
-                    <div class="key-row"><span><span class="key">W/S/A/D</span> 手动控制云台</span></div>
-                    <div class="key-row"><span><span class="key">Shift</span> 加速 | <span class="key">Space</span> 回中</span></div>
-                    <div class="key-row"><span><span class="key">🖱️ 左键</span> 单击选择目标</span></div>
-                    <div class="key-row"><span><span class="key">🖱️ 右键</span> 取消跟踪</span></div>
-                    <div class="key-row" style="margin-top: 8px; border-top: 1px solid rgba(255,255,255,0.2); padding-top: 8px;">
-                        <span style="color:#00ff88;">💡 YOLO 自动识别人/车/物</span>
+                <div class="input-group">
+                    <label>设置绝对角度 (Yaw, Pitch)</label>
+                    <div style="display: flex; gap: 5px;">
+                        <input type="number" id="setYaw" placeholder="Yaw" value="0">
+                        <input type="number" id="setPitch" placeholder="Pitch" value="0">
                     </div>
+                    <button class="btn btn-primary" onclick="setAngles()" style="margin-top: 5px; width: 100%;">设置角度</button>
                 </div>
+                <div class="input-group">
+                    <label>云台模式</label>
+                    <select id="modeSelect" onchange="setMode()">
+                        <option value="LOCK">🔒 锁定模式</option>
+                        <option value="FOLLOW">📍 跟随模式</option>
+                        <option value="FPV">✈️ FPV 模式</option>
+                    </select>
+                </div>
+            </div>
+
+            <!-- 变焦对焦 -->
+            <div class="card">
+                <h2>🔭 变焦 & 对焦</h2>
+                <div class="input-group">
+                    <label>手动变焦 (-40 ~ 40)</label>
+                    <input type="range" id="zoomSlider" min="-40" max="40" value="0" oninput="updateZoomLabel()">
+                    <div style="text-align: center; font-size: 12px; color: #aaa;" id="zoomLabel">0</div>
+                    <button class="btn btn-primary" onclick="zoomManual(parseInt(document.getElementById('zoomSlider').value))" style="margin-top: 5px; width: 100%;">执行变焦</button>
+                </div>
+                <div class="input-group">
+                    <label>绝对变焦 (1.0 ~ 40.0)</label>
+                    <input type="number" id="absZoom" value="1.0" step="0.1" min="1.0" max="40.0">
+                    <button class="btn btn-primary" onclick="zoomAbsolute()" style="margin-top: 5px; width: 100%;">设置</button>
+                </div>
+                <div style="margin-top: 15px;">
+                    <button class="btn btn-success" onclick="autoFocus()">🎯 自动对焦</button>
+                    <button class="btn btn-primary" onclick="manualFocus()" style="width: 100%; margin-top: 5px;">手动对焦</button>
+                </div>
+            </div>
+
+            <!-- 录像 & 温度 -->
+            <div class="card">
+                <h2>📹 录像 & 温度</h2>
+                <button class="btn btn-success" id="btnRecord" onclick="toggleRecord()" style="width: 100%;">▶ 开始录像</button>
+                <div class="input-group" style="margin-top: 15px;">
+                    <label>测温点 (X, Y 0-1)</label>
+                    <div style="display: flex; gap: 5px;">
+                        <input type="number" id="tempX" value="0.5" step="0.1" min="0" max="1">
+                        <input type="number" id="tempY" value="0.5" step="0.1" min="0" max="1">
+                    </div>
+                    <button class="btn btn-primary" onclick="getTemperature()" style="margin-top: 5px; width: 100%;">读取温度</button>
+                </div>
+            </div>
+
+            <!-- 图像设置 -->
+            <div class="card">
+                <h2>🎨 图像设置</h2>
+                <div class="input-group">
+                    <label>显示模式</label>
+                    <select id="imageMode">
+                        <option value="0">分割 (变倍 + 热成像)</option>
+                        <option value="1">分割 (广角 + 热成像)</option>
+                        <option value="2">分割 (变倍 + 广角)</option>
+                        <option value="3">单画面 (变倍)</option>
+                        <option value="4">单画面 (广角)</option>
+                        <option value="5">单画面 (热成像)</option>
+                    </select>
+                    <button class="btn btn-primary" onclick="setImageMode()" style="margin-top: 5px; width: 100%;">应用</button>
+                </div>
+                <div class="input-group" style="margin-top: 15px;">
+                    <label>热成像调色板</label>
+                    <select id="palette">
+                        <option value="0">☀️ 白热</option>
+                        <option value="2">🎨 棕褐色</option>
+                        <option value="3">🌈 铁红</option>
+                    </select>
+                    <button class="btn btn-primary" onclick="setPalette()" style="margin-top: 5px; width: 100%;">应用</button>
+                </div>
+            </div>
+
+            <!-- 系统控制 -->
+            <div class="card">
+                <h2>⚙️ 系统控制</h2>
+                <button class="btn btn-warning" onclick="softRestart()" style="width: 100%;">🔄 软重启</button>
+                <button class="btn btn-primary" onclick="getGimbalInfo()" style="width: 100%; margin-top: 10px;">📋 获取云台信息</button>
+            </div>
+
+            <!-- 视频流 -->
+            <div class="card" style="grid-column: span 2;">
+                <h2>📺 视频流</h2>
+                <div class="video-container">
+                    <canvas id="videoCanvas"></canvas>
+                </div>
+                <div style="margin-top: 10px;">
+                    <button class="btn btn-success" onclick="startVideo()" id="btnStartVideo">▶ 启动视频</button>
+                    <button class="btn btn-danger" onclick="stopVideo()" id="btnStopVideo" disabled>⏹ 停止视频</button>
+                    <span id="videoStatus" style="margin-left: 10px; font-size: 12px; color: #aaa;">未连接</span>
+                </div>
+            </div>
+
+            <!-- 日志 -->
+            <div class="card" style="grid-column: span 3;">
+                <h2>📝 操作日志</h2>
+                <div class="log-box" id="logBox"></div>
             </div>
         </div>
     </div>
 
     <script>
-        let serviceRunning = false;
+        const API_BASE = 'http://localhost:8082/api';
         let ws = null;
-        const keysPressed = {};
-        let controlInterval = null;
-        
-        // 鼠标控制状态
-        let isMouseGimbalInteracting = false;
-        let mouseCurrentYawSpeed = 0;
-        let mouseCurrentPitchSpeed = 0;
-        let mouseLoopInterval = null;
 
-        // 目标选择模式
-        let isSelectionMode = false;  // 选择模式开关
-        let lastClickTime = 0;
-
-        const canvas = document.getElementById('interactionCanvas');
-        const ctx = canvas.getContext('2d');
-        
-        // COCO 类别名称（常用）
-        const COCO_CLASSES = {
-            0: 'person', 1: 'bicycle', 2: 'car', 3: 'motorcycle',
-            4: 'airplane', 5: 'bus', 6: 'train', 7: 'truck', 8: 'boat'
-        };
-        
-        function log(message, type = 'info') {
-            const container = document.getElementById('logContainer');
+        function log(msg, type='info') {
+            const box = document.getElementById('logBox');
             const entry = document.createElement('div');
-            entry.className = `log-entry log-${type}`;
-            entry.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
-            container.appendChild(entry);
-            container.scrollTop = container.scrollHeight;
-            if (container.children.length > 50) container.removeChild(container.firstChild);
-        }
-        
-        function initWebSocket() {
-            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-            const wsUrl = `${protocol}//${window.location.host}/api/ws`;
-            if (ws) ws.close();
-            ws = new WebSocket(wsUrl);
-            ws.binaryType = 'blob';
-            
-            ws.onopen = () => {
-                log('✅ 视频流已连接', 'success');
-                document.getElementById('videoStream').style.display = 'block';
-                document.getElementById('videoOverlay').style.display = 'none';
-                resizeCanvas(); 
-            };
-            
-            ws.onmessage = (e) => {
-                if (e.data instanceof Blob) {
-                    const img = document.getElementById('videoStream');
-                    const oldUrl = img.src;
-                    img.src = URL.createObjectURL(e.data);
-                    if (oldUrl) URL.revokeObjectURL(oldUrl);
-                }
-            };
-            
-            ws.onclose = () => {
-                log('❌ 视频流断开，尝试重连...', 'error');
-                document.getElementById('videoStream').style.display = 'none';
-                document.getElementById('videoOverlay').style.display = 'block';
-                if (serviceRunning) setTimeout(initWebSocket, 2000); 
-            };
+            entry.className = `log-${type}`;
+            entry.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+            box.appendChild(entry);
+            box.scrollTop = box.scrollHeight;
         }
 
-        function resizeCanvas() {
-            const rect = canvas.getBoundingClientRect();
-            canvas.width = rect.width;
-            canvas.height = rect.height;
+        async function apiCall(endpoint, method='GET', data=null) {
+            try {
+                const options = { method, headers: {'Content-Type': 'application/json'} };
+                if (data) options.body = JSON.stringify(data);
+                const res = await fetch(API_BASE + endpoint, options);
+                return await res.json();
+            } catch (e) {
+                log(`${endpoint} 失败：${e.message}`, 'error');
+                return null;
+            }
         }
-        window.addEventListener('resize', resizeCanvas);
 
-        function toggleSelectionMode() {
-            isSelectionMode = !isSelectionMode;
-            const btn = document.getElementById('btnSelectionMode');
-            const hint = document.getElementById('targetHint');
-            
-            if (isSelectionMode) {
-                btn.textContent = '👆 选择模式：开';
-                btn.classList.add('btn-active-hunting');
-                canvas.style.cursor = 'crosshair';
-                hint.classList.add('show');
-                log('🎯 选择模式已开启：左键单击选择目标，右键取消跟踪', 'info');
+        async function connect() {
+            log('正在连接云台...');
+            const res = await apiCall('/connect', 'POST');
+            if (res && res.status === 'success') {
+                document.getElementById('connStatus').className = 'connection-status conn-ok';
+                document.getElementById('connStatus').textContent = '🟢 已连接';
+                document.getElementById('btnConnect').disabled = true;
+                document.getElementById('btnDisconnect').disabled = false;
+                document.getElementById('hwId').textContent = res.hardware_id || '-';
+                document.getElementById('fwVer').textContent = res.firmware_ver || '-';
+                log('✅ 云台连接成功', 'success');
+                startStatusPoll();
             } else {
-                btn.textContent = '👆 选择模式：关';
-                btn.classList.remove('btn-active-hunting');
-                canvas.style.cursor = 'default';
-                hint.classList.remove('show');
-                log('🔒 选择模式已关闭', 'info');
+                log('❌ 连接失败', 'error');
             }
         }
 
-        async function resetTracking() {
-            // 取消选择模式
-            isSelectionMode = false;
-            document.getElementById('btnSelectionMode').textContent = '👆 选择模式：关';
-            document.getElementById('btnSelectionMode').classList.remove('btn-active-hunting');
-            document.getElementById('btnSelectionMode').disabled = true;
-            canvas.style.cursor = 'default';
-            document.getElementById('targetHint').classList.remove('show');
-            
-            // 重置后端状态
-            document.getElementById('clickX').textContent = '-';
-            document.getElementById('clickY').textContent = '-';
-            document.getElementById('targetClass').textContent = '-';
-            
-            try { 
-                await fetch('/api/tracker/reset', { method: 'POST' }); 
-                log('🔄 已取消跟踪', 'info');
-            } catch (e) {}
+        async function disconnect() {
+            const res = await apiCall('/disconnect', 'POST');
+            if (res) {
+                document.getElementById('connStatus').className = 'connection-status conn-error';
+                document.getElementById('connStatus').textContent = '🔴 未连接';
+                document.getElementById('btnConnect').disabled = false;
+                document.getElementById('btnDisconnect').disabled = true;
+                log('⏹ 已断开连接', 'warning');
+            }
         }
 
-        async function switchDetector() {
-            const select = document.getElementById('detectorSelect');
-            const method = select.value;
+        async function centerGimbal() {
+            log('云台回中...');
+            const res = await apiCall('/gimbal/center', 'POST');
+            if (res) log(res.status === 'success' ? '✅ 回中成功' : '❌ 回中失败', res.status === 'success' ? 'success' : 'error');
+        }
+
+        async function resetGimbal() {
+            log('云台重置...');
+            const res = await apiCall('/gimbal/reset', 'POST');
+            if (res) log(res.status === 'success' ? '✅ 重置成功' : '❌ 重置失败', res.status === 'success' ? 'success' : 'error');
+        }
+
+        async function setAngles() {
+            const yaw = parseFloat(document.getElementById('setYaw').value);
+            const pitch = parseFloat(document.getElementById('setPitch').value);
+            log(`设置角度：Yaw=${yaw}, Pitch=${pitch}`);
+            const res = await apiCall('/gimbal/set_angles', 'POST', {yaw, pitch});
+            if (res) log(res.status === 'success' ? '✅ 角度设置成功' : '❌ 失败', res.status === 'success' ? 'success' : 'error');
+        }
+
+        async function setMode() {
+            const mode = document.getElementById('modeSelect').value;
+            log(`切换模式：${mode}`);
+            const res = await apiCall('/gimbal/set_mode', 'POST', {mode});
+            if (res && res.status === 'success') {
+                updateModeIndicator(mode);
+                log('✅ 模式切换成功', 'success');
+            }
+        }
+
+        function updateModeIndicator(mode) {
+            const el = document.getElementById('modeIndicator');
+            el.className = 'mode-indicator';
+            if (mode === 'LOCK') { el.classList.add('mode-lock'); el.textContent = '🔒 锁定模式'; }
+            else if (mode === 'FOLLOW') { el.classList.add('mode-follow'); el.textContent = '📍 跟随模式'; }
+            else if (mode === 'FPV') { el.classList.add('mode-fpv'); el.textContent = '✈️ FPV 模式'; }
+        }
+
+        function updateZoomLabel() {
+            document.getElementById('zoomLabel').textContent = document.getElementById('zoomSlider').value;
+        }
+
+        async function zoomManual(level) {
+            log(`手动变焦：${level}`);
+            const res = await apiCall('/zoom/manual', 'POST', {level});
+            if (res) log(res.status === 'success' ? '✅ 变焦成功' : '❌ 失败', res.status === 'success' ? 'success' : 'error');
+        }
+
+        async function zoomAbsolute() {
+            const zoom = parseFloat(document.getElementById('absZoom').value);
+            log(`绝对变焦：${zoom}x`);
+            const res = await apiCall('/zoom/absolute', 'POST', {zoom});
+            if (res) log(res.status === 'success' ? '✅ 变焦成功' : '❌ 失败', res.status === 'success' ? 'success' : 'error');
+        }
+
+        async function autoFocus() {
+            log('自动对焦...');
+            const res = await apiCall('/focus/auto', 'POST');
+            if (res) log(res.status === 'success' ? '✅ 自动对焦成功' : '❌ 失败', res.status === 'success' ? 'success' : 'error');
+        }
+
+        async function manualFocus() {
+            const focus = parseInt(prompt("输入对焦值 (0-255):", "128"));
+            if (!isNaN(focus)) {
+                log(`手动对焦：${focus}`);
+                const res = await apiCall('/focus/manual', 'POST', {focus});
+                if (res) log(res.status === 'success' ? '✅ 对焦成功' : '❌ 失败', res.status === 'success' ? 'success' : 'error');
+            }
+        }
+
+        let isRecording = false;
+        async function toggleRecord() {
+            const action = isRecording ? 'stop' : 'start';
+            log(`${action === 'start' ? '开始' : '停止'}录像...`);
+            const res = await apiCall('/record', 'POST', {action});
+            if (res && res.status === 'success') {
+                isRecording = res.state;
+                document.getElementById('btnRecord').textContent = isRecording ? '⏹ 停止录像' : '▶ 开始录像';
+                document.getElementById('recState').textContent = isRecording ? '录制中' : '停止';
+                log(isRecording ? '✅ 开始录像' : '✅ 停止录像', 'success');
+            }
+        }
+
+        async function getTemperature() {
+            const x = parseFloat(document.getElementById('tempX').value);
+            const y = parseFloat(document.getElementById('tempY').value);
+            log(`读取温度：(${x}, ${y})`);
+            const res = await apiCall('/temperature', 'POST', {x, y});
+            if (res && res.status === 'success') {
+                document.getElementById('temp').textContent = `${res.temperature.toFixed(1)}°C`;
+                log(`✅ 温度：${res.temperature.toFixed(1)}°C`, 'success');
+            }
+        }
+
+        async function setImageMode() {
+            const mode = parseInt(document.getElementById('imageMode').value);
+            log(`设置图像模式：${mode}`);
+            const res = await apiCall('/image_mode', 'POST', {mode});
+            if (res) log(res.status === 'success' ? '✅ 设置成功' : '❌ 失败', res.status === 'success' ? 'success' : 'error');
+        }
+
+        async function setPalette() {
+            const palette = parseInt(document.getElementById('palette').value);
+            log(`设置调色板：${palette}`);
+            const res = await apiCall('/thermal_palette', 'POST', {palette});
+            if (res) log(res.status === 'success' ? '✅ 设置成功' : '❌ 失败', res.status === 'success' ? 'success' : 'error');
+        }
+
+        async function softRestart() {
+            if (!confirm('确定要重启云台/相机吗？')) return;
+            log('软重启中...');
+            const res = await apiCall('/restart', 'POST');
+            if (res) log(res.status === 'success' ? '✅ 重启成功' : '❌ 失败', res.status === 'success' ? 'success' : 'error');
+        }
+
+        async function getGimbalInfo() {
+            log('获取云台信息...');
+            const res = await apiCall('/gimbal/info', 'GET');
+            if (res && res.status === 'success') {
+                log(`✅ 硬件 ID: ${res.info.hardware_id}`, 'success');
+                log(`✅ 固件版本：${res.info.firmware_ver}`, 'success');
+                log(`✅ 变焦级别：${res.info.zoom_level}`, 'success');
+            }
+        }
+
+let videoElement = null;
+        let videoWS = null;
+        let videoRunning = false;
+        
+        async function startVideo() {
+            log('正在启动 WebSocket 视频流...');
+            
             try {
-                const response = await fetch('/api/detector/switch', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ method: method })
-                });
-                const res = await response.json();
-                if (res.status === 'success') {
-                    log(`✅ 检测器已切换为：${res.active_method.toUpperCase()}`, 'success');
-                } else {
-                    log(`❌ 切换失败：${res.reason}`, 'error');
-                }
+                const wsUrl = 'ws://localhost:8082/api/ws';
+                videoWS = new WebSocket(wsUrl);
+                videoWS.binaryType = 'arraybuffer';
+                
+                videoWS.onopen = () => {
+                    log('✅ 视频 WebSocket 已连接', 'success');
+                    videoRunning = true;
+                    document.getElementById('videoStatus').textContent = '🟢 已连接';
+                    document.getElementById('btnStartVideo').disabled = true;
+                    document.getElementById('btnStopVideo').disabled = false;
+                };
+                
+                videoWS.onmessage = (event) => {
+                    if (!videoRunning) return;
+                    
+                    const canvas = document.getElementById('videoCanvas');
+                    const ctx = canvas.getContext('2d');
+                    
+                    // 创建图片对象
+                    const blob = new Blob([event.data], { type: 'image/jpeg' });
+                    const img = new Image();
+                    
+                    img.onload = () => {
+                        // 设置 canvas 尺寸匹配视频
+                        canvas.width = img.width;
+                        canvas.height = img.height;
+                        // 绘制帧
+                        ctx.drawImage(img, 0, 0);
+                    };
+                    
+                    img.src = URL.createObjectURL(blob);
+                };
+                
+                videoWS.onerror = (error) => {
+                    log(`❌ 视频 WebSocket 错误`, 'error');
+                    console.error(error);
+                };
+                
+                videoWS.onclose = () => {
+                    log('视频 WebSocket 已关闭', 'warning');
+                    videoRunning = false;
+                    document.getElementById('videoStatus').textContent = '🔴 已断开';
+                    document.getElementById('btnStartVideo').disabled = false;
+                    document.getElementById('btnStopVideo').disabled = true;
+                };
+                
             } catch (e) {
-                log('❌ 切换检测器请求失败', 'error');
+                log(`启动视频失败：${e.message}`, 'error');
+            }
+        }
+        
+        function stopVideo() {
+            if (videoWS) {
+                videoWS.close();
+                videoWS = null;
+            }
+            videoRunning = false;
+            log('⏹ 视频流已停止', 'warning');
+            document.getElementById('videoStatus').textContent = '未连接';
+            document.getElementById('btnStartVideo').disabled = false;
+            document.getElementById('btnStopVideo').disabled = true;
+            
+            // 清空 canvas
+            const canvas = document.getElementById('videoCanvas');
+            const ctx = canvas.getContext('2d');
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+        }
+
+        async function getStatus() {
+            const res = await apiCall('/status', 'GET');
+            if (res) {
+                document.getElementById('yaw').textContent = `${res.attitude.yaw.toFixed(1)}°`;
+                document.getElementById('pitch').textContent = `${res.attitude.pitch.toFixed(1)}°`;
+                document.getElementById('roll').textContent = `${res.attitude.roll.toFixed(1)}°`;
+                document.getElementById('zoom').textContent = `${res.zoom_level.toFixed(1)}x`;
+                if (res.temperature > 0) document.getElementById('temp').textContent = `${res.temperature.toFixed(1)}°C`;
             }
         }
 
-        async function switchTracker() {
-            const select = document.getElementById('trackerSelect');
-            const method = select.value;
-            try {
-                const response = await fetch('/api/tracker/switch', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ method: method })
-                });
-                const res = await response.json();
-                if (res.status === 'success') {
-                    log(`✅ 跟踪器已切换为：${res.active_method.toUpperCase()}`, 'success');
-                } else {
-                    log(`❌ 切换失败：${res.reason}`, 'error');
-                }
-            } catch (e) {
-                log('❌ 切换跟踪器请求失败', 'error');
-            }
+        let statusInterval = null;
+        function startStatusPoll() {
+            if (statusInterval) clearInterval(statusInterval);
+            getStatus();
+            statusInterval = setInterval(getStatus, 1000);
         }
 
-        function calculateMouseSpeed(clickX, clickY, width, height) {
-            mouseCurrentYawSpeed = Math.max(-100, Math.min(100, Math.round((clickX / width - 0.5) * 300)));
-            mouseCurrentPitchSpeed = Math.max(-100, Math.min(100, Math.round((0.5 - clickY / height) * 300)));
-            if (Math.abs(mouseCurrentYawSpeed) < 5) mouseCurrentYawSpeed = 0;
-            if (Math.abs(mouseCurrentPitchSpeed) < 5) mouseCurrentPitchSpeed = 0;
-        }
+        // 摇杆控制
+        const joystick = document.getElementById('joystick');
+        const joystickKnob = document.getElementById('joystickKnob');
+        let isDragging = false;
+        let yawSpeed = 0, pitchSpeed = 0;
+        let controlInterval = null;
 
-        // 发送点击坐标到后端
-        async function sendClickToBackend(clickX, clickY, canvasWidth, canvasHeight) {
-            const x = clickX / canvasWidth;
-            const y = clickY / canvasHeight;
-            
-            try {
-                const response = await fetch('/api/tracker/init', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ x, y, width: 0, height: 0 })
-                });
-                const res = await response.json();
-                if (res.status === 'success') {
-                    log(`🎯 已发送点击坐标 (${Math.round(clickX)}, ${Math.round(clickY)})，YOLO 正在识别...`, 'success');
-                }
-            } catch (e) {
-                log('发送点击坐标失败', 'error');
-            }
-        }
-
-        // 鼠标事件处理
-        canvas.addEventListener('contextmenu', (e) => {
-            e.preventDefault();  // 阻止右键菜单
-            
-            if (!serviceRunning) return;
-            
-            // 右键取消跟踪
-            resetTracking();
-            log('🛑 右键取消跟踪', 'info');
+        joystickKnob.addEventListener('mousedown', (e) => {
+            isDragging = true;
+            startControl();
         });
 
-        canvas.addEventListener('mousedown', (e) => {
-            if (!serviceRunning) return;
+        document.addEventListener('mousemove', (e) => {
+            if (!isDragging) return;
+            const rect = joystick.getBoundingClientRect();
+            const centerX = rect.left + rect.width / 2;
+            const centerY = rect.top + rect.height / 2;
+            let x = e.clientX - centerX;
+            let y = e.clientY - centerY;
+            const maxDist = rect.width / 2 - 25;
+            const dist = Math.sqrt(x*x + y*y);
+            if (dist > maxDist) {
+                x = (x / dist) * maxDist;
+                y = (y / dist) * maxDist;
+            }
+            joystickKnob.style.left = `calc(50% + ${x}px)`;
+            joystickKnob.style.top = `calc(50% + ${y}px)`;
             
-            const rect = canvas.getBoundingClientRect();
-            const clientX = e.clientX - rect.left;
-            const clientY = e.clientY - rect.top;
+            yawSpeed = Math.round((x / maxDist) * 100);
+            pitchSpeed = Math.round((y / maxDist) * 100);
+        });
 
-            // 左键 - 选择目标
-            if (e.button === 0) {
-                // 如果在选择模式下，或者点击模式已启用
-                if (isSelectionMode) {
-                    document.getElementById('clickX').textContent = `${Math.round(clientX)} px`;
-                    document.getElementById('clickY').textContent = `${Math.round(clientY)} px`;
-                    sendClickToBackend(clientX, clientY, rect.width, rect.height);
-                } else {
-                    // 非选择模式，使用传统的鼠标控制
-                    isMouseGimbalInteracting = true;
-                    calculateMouseSpeed(clientX, clientY, rect.width, rect.height);
-                    if (mouseLoopInterval) clearInterval(mouseLoopInterval);
-                    sendGimbal(mouseCurrentYawSpeed, mouseCurrentPitchSpeed);
-                    mouseLoopInterval = setInterval(() => {
-                        if (isMouseGimbalInteracting) sendGimbal(mouseCurrentYawSpeed, mouseCurrentPitchSpeed);
-                    }, 50);
-                }
+        document.addEventListener('mouseup', () => {
+            if (isDragging) {
+                isDragging = false;
+                joystickKnob.style.left = '50%';
+                joystickKnob.style.top = '50%';
+                yawSpeed = 0;
+                pitchSpeed = 0;
             }
         });
 
-        canvas.addEventListener('mousemove', (e) => {
-            const rect = canvas.getBoundingClientRect();
-            const clientX = e.clientX - rect.left;
-            const clientY = e.clientY - rect.top;
-
-            if (isMouseGimbalInteracting && !isSelectionMode) {
-                calculateMouseSpeed(clientX, clientY, rect.width, rect.height);
-            }
-        });
-
-        function terminateMouseControl() {
-            if (isMouseGimbalInteracting && !isSelectionMode) {
-                isMouseGimbalInteracting = false;
-                if (mouseLoopInterval) { clearInterval(mouseLoopInterval); mouseLoopInterval = null; }
-                sendGimbal(0, 0);
-            }
-        }
-
-        canvas.addEventListener('mouseup', (e) => {
-            if (e.button === 0) {  // 左键
-                if (!isSelectionMode) {
-                    terminateMouseControl();
-                }
-            }
-        });
-
-        canvas.addEventListener('mouseleave', terminateMouseControl);
-
-        async function sendGimbal(yaw, pitch) {
-            yaw = Math.max(-100, Math.min(100, parseInt(yaw || 0)));
-            pitch = Math.max(-100, Math.min(100, parseInt(pitch || 0)));
-            try {
-                await fetch('/api/gimbal/control', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ yaw, pitch })
-                });
-                document.getElementById('statusYaw').textContent = yaw;
-                document.getElementById('statusPitch').textContent = pitch;
-            } catch (error) {}
-        }
-        
-        function centerGimbal() {
-            sendGimbal(0, 0);
-            log('🎯 云台回中', 'info');
-        }
-        
-        function updateConnectionStatus(online, msg = '') {
-            const el = document.getElementById('connStatus');
-            el.className = `connection-status ${online ? 'conn-ok' : 'conn-error'}`;
-            el.textContent = online ? '🟢 已连接 ' + msg : '🔴 未连接 ' + msg;
-        }
-        
-        function startService() {
-            serviceRunning = true;
-            document.getElementById('btnStart').disabled = true;
-            document.getElementById('btnStop').disabled = false;
-            document.getElementById('btnSelectionMode').disabled = false;
-            document.getElementById('mainStatus').textContent = '● 运行中';
-            document.getElementById('mainStatus').style.color = '#00ff88';
-            log('🚀 服务启动成功', 'success');
-            updateConnectionStatus(true);
-            initWebSocket();
-            centerGimbal();
-            startKeyboardControl();
-            
-            // 默认开启选择模式
-            toggleSelectionMode();
-        }
-        
-        function stopService() {
-            serviceRunning = false;
-            if (ws) { ws.close(); ws = null; }
+        function startControl() {
             if (controlInterval) clearInterval(controlInterval);
-            if (mouseLoopInterval) clearInterval(mouseLoopInterval);
-            isMouseGimbalInteracting = false;
-            isSelectionMode = false;
-            document.getElementById('btnStart').disabled = false;
-            document.getElementById('btnStop').disabled = true;
-            document.getElementById('btnSelectionMode').disabled = true;
-            document.getElementById('mainStatus').textContent = '已停止';
-            document.getElementById('mainStatus').style.color = '#ff6b6b';
-            resetTracking();
-            log('⏹ 系统安全停机', 'warning');
-            updateConnectionStatus(false);
+            controlInterval = setInterval(async () => {
+                if (yawSpeed !== 0 || pitchSpeed !== 0) {
+                    await apiCall('/gimbal/rotate', 'POST', {yaw_speed: yawSpeed, pitch_speed: -pitchSpeed});
+                }
+            }, 100);
         }
-        
-        function startKeyboardControl() {
-            document.addEventListener('keydown', (e) => {
-                keysPressed[e.key.toLowerCase()] = true;
-                if (e.code === 'Space') { e.preventDefault(); centerGimbal(); }
-            });
-            document.addEventListener('keyup', (e) => { keysPressed[e.key.toLowerCase()] = false; });
-            controlInterval = setInterval(() => {
-                if (!serviceRunning || isMouseGimbalInteracting) return;
-                const speed = keysPressed['shift'] ? 100 : 50;
-                let yaw = 0, pitch = 0;
-                if (keysPressed['w']) pitch = speed;
-                if (keysPressed['s']) pitch = -speed;
-                if (keysPressed['a']) yaw = -speed;
-                if (keysPressed['d']) yaw = speed;
-                if (yaw !== 0 || pitch !== 0) sendGimbal(yaw, pitch);
-            }, 50);
-        }
-        
-        setInterval(async () => {
-            if (!serviceRunning) return;
-            try {
-                const res = await fetch('/api/status');
-                const data = await res.json();
-                const modeEl = document.getElementById('modeIndicator');
-                
-                if (data.system_mode === 'manual') {
-                    modeEl.textContent = '🎮 手动控制中';
-                    modeEl.className = 'mode-indicator mode-manual';
-                } else {
-                    if (data.tracking_mode === 'yolo') {
-                        modeEl.textContent = '🤖 YOLO 跟踪中';
-                        modeEl.className = 'mode-indicator mode-yolo';
-                    } else if (data.tracking_mode === 'face') {
-                        modeEl.textContent = '👤 人脸跟踪中';
-                        modeEl.className = 'mode-indicator mode-auto';
-                    } else if (data.tracking_mode === 'object') {
-                        modeEl.textContent = '🎯 物体跟踪中';
-                        modeEl.className = 'mode-indicator mode-auto';
-                    } else {
-                        modeEl.textContent = '⏸️ 待机中 (请点击目标)';
-                        modeEl.className = 'mode-indicator mode-idle';
-                    }
-                }
-                
-                const detectorEl = document.getElementById('currentDetector');
-                if (detectorEl && data.detector_type) {
-                    let displayType = data.detector_type.toUpperCase();
-                    if (data.detector_type === 'yolo') displayType = 'YOLOv8';
-                    else if (data.detector_type.includes('dnn')) displayType = 'DNN';
-                    detectorEl.textContent = displayType;
-                }
-
-                const trackerEl = document.getElementById('currentTracker');
-                if (trackerEl && data.tracker_type) {
-                    let displayTracker = data.tracker_type.toUpperCase();
-                    if (data.tracker_type === 'hybrid') displayTracker = 'Hybrid';
-                    trackerEl.textContent = displayTracker;
-                }
-                
-                // 目标类别
-                const classEl = document.getElementById('targetClass');
-                if (data.yolo_class_name) {
-                    classEl.textContent = data.yolo_class_name;
-                } else {
-                    classEl.textContent = '-';
-                }
-                
-            } catch (e) {}
-        }, 300);
 
         window.addEventListener('load', () => {
-            log('系统初始化完成', 'success');
+            log('🚀 系统初始化完成', 'success');
         });
     </script>
 </body>
