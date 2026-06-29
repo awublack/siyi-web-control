@@ -20,6 +20,7 @@ logger = logging.getLogger('siyi-test-backend')
 
 try:
     import cv2
+    import numpy as np
     CV2_AVAILABLE = True
     logger.info("✅ OpenCV 已加载")
 except ImportError:
@@ -43,6 +44,79 @@ RTSP_URL = os.environ.get('RTSP_URL', f"rtsp://{CAMERA_IP}:8554/main.264")
 VIDEO_W = 640
 VIDEO_H = 480
 VIDEO_FPS = 20
+
+# 云台控制参数（参考 resilient backend）
+K_PX_TO_DEG = 0.22
+DEADZONE_PX = 5
+MANUAL_SPEED_DEG_PER_SEC = 80.0
+REVERSE_PITCH = True
+MAX_ANGULAR_SPEED = 30.0
+
+# 全局云台控制状态
+class GimbalControlState:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.target_yaw = 0.0
+        self.target_pitch = 0.0
+        self.last_manual_time = 0.0
+        self.manual_mode = False
+        self.manual_yaw = 0
+        self.manual_pitch = 0
+
+g_gimbal_state = GimbalControlState()
+g_gimbal_control_thread = None
+g_stop_control_event = threading.Event()
+
+# ==================== 云台控制线程 ====================
+def gimbal_control_loop(udp_manager):
+    """后台持续发送位置命令到云台"""
+    last_time = time.time()
+    
+    while not g_stop_control_event.is_set():
+        now = time.time()
+        dt = now - last_time
+        last_time = now
+        dt = min(dt, 0.15)  # 最大 dt 限制
+        
+        with g_gimbal_state.lock:
+            # 如果有手动输入，更新目标角度
+            if g_gimbal_state.manual_mode and (g_gimbal_state.manual_yaw != 0 or g_gimbal_state.manual_pitch != 0):
+                g_gimbal_state.target_yaw += (g_gimbal_state.manual_yaw / 100.0) * MANUAL_SPEED_DEG_PER_SEC * dt
+                g_gimbal_state.target_pitch += (g_gimbal_state.manual_pitch / 100.0) * MANUAL_SPEED_DEG_PER_SEC * dt
+                g_gimbal_state.target_yaw = max(-135.0, min(135.0, g_gimbal_state.target_yaw))
+                g_gimbal_state.target_pitch = max(-90.0, min(90.0, g_gimbal_state.target_pitch))
+            
+            tgt_y = g_gimbal_state.target_yaw
+            tgt_p = g_gimbal_state.target_pitch
+        
+        # 发送位置命令
+        cmd = build_position_cmd(tgt_y, tgt_p, reverse_pitch=REVERSE_PITCH)
+        try:
+            udp_manager.send(cmd)
+        except Exception as e:
+            logger.error(f"云台控制发送失败：{e}")
+        
+        # 控制循环频率 ~30Hz
+        elapsed = time.time() - now
+        sleep_time = max(0.0, 0.033 - elapsed)
+        if sleep_time > 0:
+            g_stop_control_event.wait(sleep_time)
+
+def start_gimbal_control(udp_manager):
+    """启动云台控制线程"""
+    global g_gimbal_control_thread, g_stop_control_event
+    g_stop_control_event.clear()
+    g_gimbal_control_thread = threading.Thread(target=gimbal_control_loop, args=(udp_manager,), daemon=True)
+    g_gimbal_control_thread.start()
+    logger.info("🎮 云台位置控制线程已启动")
+
+def stop_gimbal_control():
+    """停止云台控制线程"""
+    global g_gimbal_control_thread, g_stop_control_event
+    g_stop_control_event.set()
+    if g_gimbal_control_thread:
+        g_gimbal_control_thread.join(timeout=1)
+    logger.info("🎮 云台位置控制线程已停止")
 
 # ==================== CRC16 计算 ====================
 def calculate_crc16_xmodem(data: bytes) -> bytes:
@@ -71,17 +145,21 @@ def build_center_cmd() -> bytes:
     return build_cmd(0x00)
 
 def build_rotate_cmd(yaw_speed: int, pitch_speed: int) -> bytes:
-    """云台旋转命令 (CMD 0x01)"""
+    """云台旋转命令 (CMD 0x01) - 速度控制"""
     yaw = max(-100, min(100, yaw_speed))
     pitch = max(-100, min(100, pitch_speed))
     payload = bytes([yaw & 0xFF, pitch & 0xFF])
     return build_cmd(0x01, payload)
 
-def build_set_angles_cmd(yaw_deg: float, pitch_deg: float) -> bytes:
-    """设置绝对角度命令 (CMD 0x0E - 位置控制)"""
+def build_position_cmd(yaw_deg: float, pitch_deg: float, reverse_pitch: bool = True) -> bytes:
+    """设置绝对角度命令 (CMD 0x0E - 位置控制)
+    参考 siyi-backend-server-resilient.py 的实现
+    """
     header = bytes.fromhex("556601040000000E")
     yaw_val = int(yaw_deg * 10)
     pitch_val = int(pitch_deg * 10)
+    if reverse_pitch:
+        pitch_val = -pitch_val
     yaw_val = max(-32768, min(32767, yaw_val))
     pitch_val = max(-32768, min(32767, pitch_val))
     yaw_bytes = yaw_val.to_bytes(2, byteorder='little', signed=True)
@@ -289,16 +367,11 @@ g_udp = SIYIUDPManager()
 async def handle_connect(request):
     """连接云台"""
     try:
-        if g_udp.connected:
-            return web.json_response({
-                'status': 'success',
-                'connected': True,
-                'message': '已经连接',
-                'hardware_id': g_udp.hardware_id,
-                'firmware_ver': g_udp.firmware_ver
-            })
-        
         success = g_udp.connect()
+        
+        # 启动云台控制线程
+        start_gimbal_control(g_udp)
+        
         return web.json_response({
             'status': 'success',
             'connected': True,
@@ -311,6 +384,11 @@ async def handle_connect(request):
 async def handle_disconnect(request):
     """断开连接"""
     try:
+        # 停止云台控制线程
+        stop_gimbal_control()
+        
+        # 发送停止命令
+        g_udp.send(build_rotate_cmd(0, 0))
         g_udp.disconnect()
         return web.json_response({'status': 'success', 'disconnected': True})
     except Exception as e:
@@ -319,38 +397,62 @@ async def handle_disconnect(request):
 async def handle_center_gimbal(request):
     """云台回中"""
     try:
+        # 重置目标角度到 0
+        with g_gimbal_state.lock:
+            g_gimbal_state.target_yaw = 0.0
+            g_gimbal_state.target_pitch = 0.0
+            g_gimbal_state.manual_yaw = 0
+            g_gimbal_state.manual_pitch = 0
+            g_gimbal_state.manual_mode = False
+        
+        # 发送回中命令
         cmd = build_center_cmd()
-        success = g_udp.send(cmd)
-        # 重置目标角度
+        g_udp.send(cmd)
+        
+        # 也发送位置命令确保回到 0,0
+        cmd = build_position_cmd(0, 0, reverse_pitch=REVERSE_PITCH)
+        g_udp.send(cmd)
+        
         g_udp.attitude = {'yaw': 0.0, 'pitch': 0.0, 'roll': 0.0}
-        return web.json_response({'status': 'success' if success else 'failed'})
+        return web.json_response({'status': 'success'})
     except Exception as e:
         return web.json_response({'status': 'error', 'reason': str(e)}, status=500)
 
 async def handle_gimbal_rotate(request):
-    """云台旋转"""
+    """云台旋转 - 使用位置控制"""
     try:
         data = await request.json()
         yaw_speed = int(data.get('yaw_speed', 0))
         pitch_speed = int(data.get('pitch_speed', 0))
         
-        cmd = build_rotate_cmd(yaw_speed, pitch_speed)
-        success = g_udp.send(cmd)
-        return web.json_response({'status': 'success' if success else 'failed'})
+        # 更新手动控制状态
+        with g_gimbal_state.lock:
+            g_gimbal_state.manual_mode = True
+            g_gimbal_state.manual_yaw = yaw_speed
+            g_gimbal_state.manual_pitch = pitch_speed
+        
+        return web.json_response({'status': 'success'})
     except Exception as e:
         return web.json_response({'status': 'error', 'reason': str(e)}, status=500)
 
 async def handle_set_angles(request):
-    """设置绝对角度"""
+    """设置绝对角度 - 使用位置控制"""
     try:
         data = await request.json()
         yaw = float(data.get('yaw', 0))
         pitch = float(data.get('pitch', 0))
         
-        # 发送位置控制命令
-        cmd = build_set_angles_cmd(yaw, pitch)
-        success = g_udp.send(cmd)
-        return web.json_response({'status': 'success' if success else 'failed'})
+        # 直接设置目标角度
+        with g_gimbal_state.lock:
+            g_gimbal_state.target_yaw = yaw
+            g_gimbal_state.target_pitch = pitch
+            g_gimbal_state.manual_mode = False
+        
+        # 立即发送位置命令
+        cmd = build_position_cmd(yaw, pitch, reverse_pitch=REVERSE_PITCH)
+        g_udp.send(cmd)
+        
+        return web.json_response({'status': 'success'})
     except Exception as e:
         return web.json_response({'status': 'error', 'reason': str(e)}, status=500)
 
@@ -544,50 +646,74 @@ async def handle_gimbal_info(request):
 # WebSocket 视频流
 
 if CV2_AVAILABLE:
+    import subprocess
+    
     class VideoStreamer:
-        """RTSP 视频流采集和分发"""
+        """RTSP 视频流采集和分发 - 使用 FFmpeg"""
         
         def __init__(self, rtsp_url):
             self.rtsp_url = rtsp_url
-            self.cap = None
-            self.running = False
             self.frame = None
+            self.running = False
             self.lock = threading.Lock()
-            self.clients = []
             self.thread = None
         
         def start(self):
             """启动视频采集线程"""
-            if not CV2_AVAILABLE:
-                logger.error("❌ OpenCV 不可用，无法启动视频流")
-                return False
-            
-            self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
-            if not self.cap.isOpened():
-                logger.error(f"❌ 无法打开 RTSP 流：{self.rtsp_url}")
-                return False
-            
-            logger.info(f"✅ 已连接到 RTSP 流：{self.rtsp_url}")
+            logger.info(f"🎬 使用 FFmpeg 读取 RTSP 流：{self.rtsp_url}")
             self.running = True
-            self.thread = threading.Thread(target=self._capture_loop, daemon=True)
+            self.thread = threading.Thread(target=self._read_frames, daemon=True)
             self.thread.start()
             return True
         
-        def _capture_loop(self):
-            """视频采集循环"""
+        def _read_frames(self):
+            """使用 FFmpeg 读取视频帧"""
+            cmd = [
+                'ffmpeg',
+                '-rtsp_transport', 'tcp',
+                '-i', self.rtsp_url,
+                '-f', 'image2pipe',
+                '-pix_fmt', 'bgr24',
+                '-vcodec', 'rawvideo',
+                '-an',
+                '-s', f'{VIDEO_W}x{VIDEO_H}',
+                '-'
+            ]
+            
             while self.running:
-                ret, frame = self.cap.read()
-                if ret:
-                    # 调整大小
-                    frame = cv2.resize(frame, (VIDEO_W, VIDEO_H))
-                    # JPEG 压缩
-                    _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
-                    with self.lock:
-                        self.frame = buffer.tobytes()
-                else:
-                    logger.warning("⚠️ 读取帧失败，重试中...")
-                    time.sleep(0.1)
-                time.sleep(1.0 / VIDEO_FPS)
+                try:
+                    pipe = subprocess.Popen(
+                        cmd, 
+                        stdout=subprocess.PIPE, 
+                        stderr=subprocess.DEVNULL, 
+                        bufsize=10**8
+                    )
+                    
+                    frame_size = VIDEO_W * VIDEO_H * 3
+                    
+                    while self.running:
+                        raw_frame = pipe.stdout.read(frame_size)
+                        if not raw_frame:
+                            logger.warning("⚠️ FFmpeg 流中断，重新连接...")
+                            break
+                        
+                        # 转换为 numpy 数组
+                        frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape(
+                            (VIDEO_H, VIDEO_W, 3)
+                        )
+                        
+                        # JPEG 压缩
+                        _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
+                        
+                        with self.lock:
+                            self.frame = buffer.tobytes()
+                        
+                except Exception as e:
+                    logger.error(f"❌ FFmpeg 错误：{e}")
+                    time.sleep(1)
+                finally:
+                    if 'pipe' in locals():
+                        pipe.kill()
         
         def get_frame(self):
             """获取当前帧"""
@@ -598,10 +724,8 @@ if CV2_AVAILABLE:
             """停止视频流"""
             self.running = False
             if self.thread:
-                self.thread.join(timeout=1)
-            if self.cap:
-                self.cap.release()
-                logger.info("📹 视频流已停止")
+                self.thread.join(timeout=2)
+            logger.info("📹 视频流已停止")
 else:
     class VideoStreamer:
         """OpenCV 不可用时的占位类"""
@@ -621,17 +745,29 @@ async def websocket_handler(request):
     ws = web.WebSocketResponse()
     await ws.prepare(request)
     logger.info("🎥 WebSocket 客户端连接")
+    
+    last_frame_time = time.time()
+    frame_interval = 1.0 / VIDEO_FPS
+    
     try:
         while not ws.closed:
             # 发送视频帧
             if video_streamer:
                 frame = video_streamer.get_frame()
                 if frame:
-                    await ws.send_bytes(frame)
-                    continue
+                    try:
+                        await ws.send_bytes(frame)
+                        # 控制帧率
+                        elapsed = time.time() - last_frame_time
+                        if elapsed < frame_interval:
+                            await asyncio.sleep(frame_interval - elapsed)
+                        last_frame_time = time.time()
+                        continue
+                    except Exception as e:
+                        logger.warning(f"发送帧失败：{e}")
             
-            # 如果没有视频帧，发送占位符保持连接
-            await asyncio.sleep(1.0 / VIDEO_FPS)
+            # 没有视频帧时短暂等待
+            await asyncio.sleep(0.1)
             
             # 处理客户端消息
             try:
